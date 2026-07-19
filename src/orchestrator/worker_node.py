@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import argparse
+import os
 import pickle
 import socket
 import struct
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import numpy as np
 from max.dtype import DType
@@ -126,3 +131,12 @@ class WorkerNode:
         msg_type, payload_len = struct.unpack("!II", header)
         payload = _recv_exact(conn, payload_len)
         return msg_type, pickle.loads(payload) if payload else None
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Distributed Llama Worker Node")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=9000, help="Port to listen on")
+    args = parser.parse_args()
+    worker = WorkerNode(host=args.host, port=args.port)
+    worker.start()

@@ -25,3 +25,5 @@ Phase 2: Python max.graph FFN builder with non-uniform ShardSpec
 Phase 3: Mojo comm kernels (ring_all_reduce, all_to_all) + threaded mock test
 Phase 4: Ulysses attention graph (Q normal, KV sequence-sharded)
 Phase 5: Orchestrator integration + Level 2 drift detector
+Phase 6: Real network integration (RootNode + WorkerNode over TCP)
+Phase 7: Weight loading, slicing, and text generation pipeline
