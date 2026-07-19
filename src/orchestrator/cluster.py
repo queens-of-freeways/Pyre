@@ -90,70 +90,41 @@ class ClusterOrchestrator:
     def run(self, x: np.ndarray) -> np.ndarray:
         batch, seq_len, hidden_dim = x.shape
         assert hidden_dim == self.config.hidden_dim
-        
+
         # 1. Split input along sequence dimension for Ulysses attention
-        x_slices = []
-        for node_id in self.partitions:
-            p = self.partitions[node_id]
-            x_slice = x[:, p["seq_start"]:p["seq_end"], :]
-            x_slices.append(x_slice)
-        
-        # 2. Pass slices through each node's attention graph
-        # Mocking weights for attention
-        q_outputs, k_outputs, v_outputs = [], [], []
+        # 2. Pass slices through each node's attention graph (mock: just execute)
         for i, node_id in enumerate(self.partitions):
             p = self.partitions[node_id]
-            local_seq = p["seq_end"] - p["seq_start"]
+            x_slice = x[:, p["seq_start"]:p["seq_end"], :]
             n_q_heads_local = (p["ffn_end"] - p["ffn_start"]) // self.config.head_dim
-            
-            x_slice = x_slices[i]
             wq_slice = np.random.randn(hidden_dim, n_q_heads_local * self.config.head_dim).astype(np.float32)
             wk_full = np.random.randn(hidden_dim, self.config.n_kv_heads * self.config.head_dim).astype(np.float32)
             wv_full = np.random.randn(hidden_dim, self.config.n_kv_heads * self.config.head_dim).astype(np.float32)
-            
-            (q, k, v) = self.attn_models[node_id].execute(
+            self.attn_models[node_id].execute(
                 np.ascontiguousarray(x_slice),
                 np.ascontiguousarray(wq_slice),
                 np.ascontiguousarray(wk_full),
                 np.ascontiguousarray(wv_full)
             )
-            q_outputs.append(q.to_numpy())
-            k_outputs.append(k.to_numpy())
-            v_outputs.append(v.to_numpy())
-        
-        # 3. Simulate all-to-all by concatenating Q, K, V tensors back together
-        q_full = np.concatenate(q_outputs, axis=2)  # Concat along head dimension
-        k_full = np.concatenate(k_outputs, axis=1)  # Concat along seq dimension
-        v_full = np.concatenate(v_outputs, axis=1)
-        
-        # Mock attention output (Q * K^T * V)
-        # For simplicity, just use q_full reshaped back to hidden_dim for FFN input
+
+        # 3. Mock attention output for FFN input
         attn_out = np.random.randn(batch, seq_len, hidden_dim).astype(np.float32)
-        
-        # 4. Pass attention output through each node's FFN graph
-        partial_ffn_outputs = []
-        for i, node_id in enumerate(self.partitions):
+
+        # 4. Pass slices through each node's FFN graph, placing partials back
+        final_output = np.zeros((batch, seq_len, hidden_dim), dtype=np.float32)
+        for node_id in self.partitions:
             p = self.partitions[node_id]
             width = p["ffn_end"] - p["ffn_start"]
-            local_seq = p["seq_end"] - p["seq_start"]
-            
-            # FFN expects local sequence slice
             attn_slice = attn_out[:, p["seq_start"]:p["seq_end"], :]
             ffn_up_slice = np.random.randn(hidden_dim, width).astype(np.float32)
             ffn_down_slice = np.random.randn(width, hidden_dim).astype(np.float32)
-            
             (partial,) = self.ffn_models[node_id].execute(
                 np.ascontiguousarray(attn_slice),
                 np.ascontiguousarray(ffn_up_slice),
                 np.ascontiguousarray(ffn_down_slice)
             )
-            partial_ffn_outputs.append(partial.to_numpy())
-        
-        # 5. Simulate ring all-reduce by summing all partial FFN outputs
-        final_output = np.zeros_like(partial_ffn_outputs[0])
-        for p_out in partial_ffn_outputs:
-            final_output += p_out
-            
+            final_output[:, p["seq_start"]:p["seq_end"], :] += partial.to_numpy()
+
         return final_output
 
     def detect_drift(self, execution_times: List[float]) -> bool:
