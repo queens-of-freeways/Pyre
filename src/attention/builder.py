@@ -27,12 +27,16 @@ def build_ulysses_attention_graph(
     n_kv_heads: int,
     head_dim: int,
     device: DeviceRef,
+    full_q_weights: bool = False,
 ) -> Graph:
     local_seq_len = shard.local_seq_len()
-    n_q_heads_local = shard.ffn_width() // head_dim
+    if full_q_weights:
+        n_q_local = n_heads
+    else:
+        n_q_local = shard.ffn_width() // head_dim
 
     x_type = TensorType(DType.float32, [1, local_seq_len, hidden_dim], device=device)
-    wq_slice_type = TensorType(DType.float32, [hidden_dim, n_q_heads_local * head_dim], device=device)
+    wq_slice_type = TensorType(DType.float32, [hidden_dim, n_q_local * head_dim], device=device)
     wk_full_type = TensorType(DType.float32, [hidden_dim, n_kv_heads * head_dim], device=device)
     wv_full_type = TensorType(DType.float32, [hidden_dim, n_kv_heads * head_dim], device=device)
 
@@ -46,7 +50,7 @@ def build_ulysses_attention_graph(
         k = ops.matmul(x, wk_full)
         v = ops.matmul(x, wv_full)
         
-        q = ops.reshape(q, [1, local_seq_len, n_q_heads_local, head_dim])
+        q = ops.reshape(q, [1, local_seq_len, n_q_local, head_dim])
         k = ops.reshape(k, [1, local_seq_len, n_kv_heads, head_dim])
         v = ops.reshape(v, [1, local_seq_len, n_kv_heads, head_dim])
         

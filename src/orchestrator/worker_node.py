@@ -24,6 +24,8 @@ MSG_READY = 1
 MSG_FORWARD_DATA = 2
 MSG_FORWARD_RESULT = 3
 MSG_SHUTDOWN = 4
+MSG_ATTN_OUTPUT = 5
+MSG_FFN_RESULT = 6
 
 
 def _recv_exact(conn, n):
@@ -48,6 +50,8 @@ class WorkerNode:
         self.config = None
         self.local_seq_len = None
         self.hidden_dim = None
+        self.ffn_up_slice = None
+        self.ffn_down_slice = None
 
     def start(self):
         try:
@@ -57,7 +61,7 @@ class WorkerNode:
             server.listen(1)
 
             conn, addr = server.accept()
-            conn.settimeout(60.0)
+            conn.settimeout(180.0)
 
             msg_type, obj = self._recv_msg(conn)
             if msg_type != MSG_SHARD_SPEC:
@@ -73,6 +77,7 @@ class WorkerNode:
                 shard_spec, model_config.hidden_dim,
                 model_config.n_heads, model_config.n_kv_heads,
                 model_config.head_dim, self.device,
+                full_q_weights=True,
             )
             ffn_graph = build_ffn_graph(
                 shard_spec, model_config.hidden_dim, self.device,
@@ -84,30 +89,32 @@ class WorkerNode:
             self._send_msg(conn, MSG_READY)
 
             while True:
-                msg_type, arrays = self._recv_msg(conn)
+                msg_type, data = self._recv_msg(conn)
                 if msg_type == MSG_SHUTDOWN:
                     break
-                if msg_type != MSG_FORWARD_DATA:
-                    continue
+                if msg_type == MSG_FORWARD_DATA:
+                    x_slice, wq_slice, wk_full, wv_full, ffn_up, ffn_down = data
+                    self.ffn_up_slice = ffn_up
+                    self.ffn_down_slice = ffn_down
 
-                x_slice, wq_slice, wk_full, wv_full, ffn_up_slice, ffn_down_slice = arrays
-
-                self.attn_model.execute(
-                    np.ascontiguousarray(x_slice),
-                    np.ascontiguousarray(wq_slice),
-                    np.ascontiguousarray(wk_full),
-                    np.ascontiguousarray(wv_full),
-                )
-
-                mock_attn = np.random.randn(1, self.local_seq_len, self.hidden_dim).astype(np.float32)
-
-                (partial,) = self.ffn_model.execute(
-                    np.ascontiguousarray(mock_attn),
-                    np.ascontiguousarray(ffn_up_slice),
-                    np.ascontiguousarray(ffn_down_slice),
-                )
-
-                self._send_msg(conn, MSG_FORWARD_RESULT, partial.to_numpy())
+                    (q, k, v) = self.attn_model.execute(
+                        np.ascontiguousarray(x_slice),
+                        np.ascontiguousarray(wq_slice),
+                        np.ascontiguousarray(wk_full),
+                        np.ascontiguousarray(wv_full),
+                    )
+                    self._send_msg(
+                        conn, MSG_FORWARD_RESULT,
+                        (q.to_numpy(), k.to_numpy(), v.to_numpy()),
+                    )
+                elif msg_type == MSG_ATTN_OUTPUT:
+                    (attn_slice,) = data
+                    (partial,) = self.ffn_model.execute(
+                        np.ascontiguousarray(attn_slice),
+                        np.ascontiguousarray(self.ffn_up_slice),
+                        np.ascontiguousarray(self.ffn_down_slice),
+                    )
+                    self._send_msg(conn, MSG_FFN_RESULT, partial.to_numpy())
         except Exception as e:
             import traceback
             traceback.print_exc()
