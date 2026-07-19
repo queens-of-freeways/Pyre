@@ -1,0 +1,61 @@
+# MAX guides
+
+> MAX developer guides covering deployment, inference, and model development.
+
+This file contains links to documentation sections following the llmstxt.org standard.
+
+## Table of Contents
+
+- [What's new](https://docs.modular.com/max/changelog.md): Release notes for each version of the Modular Platform.
+- [Using AI coding assistants](https://docs.modular.com/max/coding-assistants.md): Use AI coding assistants such as Cursor, Claude Code, Copilot, and Windsurf with Modular.
+- [MAX container](https://docs.modular.com/max/container.md): Learn more about the provided Docker container for MAX deployment
+- [Benchmark MAX on NVIDIA or AMD GPUs](https://docs.modular.com/max/deploy/benchmark.md): Learn how to use our benchmarking script to measure the performance of MAX
+- [Deploy MAX on GPU with self-hosted endpoints](https://docs.modular.com/max/deploy/local-to-cloud.md): Learn how to deploy MAX pipelines to cloud
+- [Basic operations](https://docs.modular.com/max/develop/basic-ops.md): Perform tensor operations for arithmetic, shape manipulation, reductions, and random generation
+- [Broadcasting](https://docs.modular.com/max/develop/broadcasting.md): Learn broadcasting rules, automatic expansion in elementwise ops, and F.broadcast_to for explicit shapes
+- [Build custom ops for GPUs](https://docs.modular.com/max/develop/build-custom-ops.md): Write custom GPU and CPU operations in Mojo and load them into a MAX graph.
+- [Write hardware-agnostic custom ops for PyTorch](https://docs.modular.com/max/develop/custom-kernels-pytorch.md): Learn to write custom operators in Mojo for PyTorch
+- [Optimize custom ops for GPUs with Mojo](https://docs.modular.com/max/develop/custom-ops-matmul.md): Learn to use Mojo's GPU programming abstractions to progressively optimize a matrix multiplication
+- [Intro to custom ops](https://docs.modular.com/max/develop/custom-ops.md): Extend MAX Graph with custom Mojo kernels for optimized performance
+- [Accuracy issues](https://docs.modular.com/max/develop/debugging-accuracy.md): Catch NaN and Inf values and uninitialized memory reads in your MAX model with accuracy debugging options.
+- [Runtime errors](https://docs.modular.com/max/develop/debugging-errors.md): Capture Mojo stack traces and dump compiler IR to investigate unrecoverable failures in your MAX model.
+- [GPU errors](https://docs.modular.com/max/develop/debugging-gpu.md): Force synchronous GPU execution and enable kernel-level bounds checking to pinpoint the op that caused a failure.
+- [Execution tracing](https://docs.modular.com/max/develop/debugging-tracing.md): See which operations MAX runs, in what order, and on which device, and map each op back to its Python source.
+- [Model debugging overview](https://docs.modular.com/max/develop/debugging.md): Review and configure available MAX debugging tools to diagnose issues during model development.
+- [Data types (dtype)](https://docs.modular.com/max/develop/dtypes.md): Learn how to use dtypes to control tensor precision and interoperability
+- [Eager execution](https://docs.modular.com/max/develop/eager-execution.md): Use the eager API to create tensors, apply operations, inspect intermediate values, and run a forward pass.
+- [Graph overview](https://docs.modular.com/max/develop/graph.md): Learn why MAX uses graph compilation and how two programming patterns — explicit graph construction and eager-like execution — both produce graphs.
+- [Model development overview](https://docs.modular.com/max/develop.md): Learn the process to bring a trained model from Hugging Face to MAX.
+- [Indexing and slicing](https://docs.modular.com/max/develop/indexing.md): Use slice syntax, F.gather, F.where, and F.scatter to read and write tensor values
+- [Write a custom layer](https://docs.modular.com/max/develop/layers.md): Write a custom layer for a model component that max.nn doesn't provide, and connect it to your model.
+- [Logit comparison](https://docs.modular.com/max/develop/logit-comparison.md): Measure how closely a custom MAX model matches a PyTorch reference using mean absolute error, cosine distance, and KL divergence.
+- [Serve a fine-tuned model on a supported architecture](https://docs.modular.com/max/develop/max-pipeline-bring-your-own-model.md): Serve a fine-tuned model checkpoint with MAX when the base architecture is already supported, with no architecture code required.
+- [Bring up a model with MAX skills](https://docs.modular.com/max/develop/model-bringup-skills.md): Learn how to bring up new Hugging Face models in MAX using AI coding agents and MAX skills, including installation, prompting, and verification.
+- [Model bring-up workflow](https://docs.modular.com/max/develop/model-bringup-workflow.md): Understand MAX's model architecture system and how to implement a custom architecture by mapping config fields, translating weight names, connectin...
+- [Build a model graph with Module](https://docs.modular.com/max/develop/modules.md): Learn how to compose modules, write custom modules with explicit weights, load checkpoint data, and construct a model graph.
+- [Model pipeline](https://docs.modular.com/max/develop/pipelines.md): Learn how to integrate your model into a pipeline for serving with MAX.
+- [Read a Hugging Face model config](https://docs.modular.com/max/develop/read-model-config.md): Translate Hugging Face config.json fields into MAX architecture decisions to identify what to reuse, subclass, or implement.
+- [Serve your custom model](https://docs.modular.com/max/develop/serve-custom-model-architectures.md): Learn how to serve a model with a custom architecture with max serve and send inference requests to it.
+- [Tensor realization](https://docs.modular.com/max/develop/tensor-realization.md): Understand how MAX realizes tensors so you can reason about eager performance and write code the graph compiler can optimize.
+- [Tensor fundamentals](https://docs.modular.com/max/develop/tensors.md): This page provides an overview of tensors, why they matter, and how to create and work with them in MAX.
+- [Weight adapters](https://docs.modular.com/max/develop/weight-adapters.md): Load a checkpoint into a MAX model by writing a weight adapter that reconciles names, dtypes, and key sets.
+- [Environment variables](https://docs.modular.com/max/environment-variables.md): Reference for all configurable environment variables in MAX
+- [FAQ](https://docs.modular.com/max/faq.md): Answers to various questions about the Modular platform.
+- [Quickstart](https://docs.modular.com/max/get-started.md): A quickstart guide to run a GenAI model locally with Modular.
+- [GPU profiling with Nsight Systems](https://docs.modular.com/max/gpu-system-profiling.md): How to profile MAX models and endpoints with Nsight Systems.
+- [Quantization](https://docs.modular.com/max/graph/quantize.md): An introduction to the MAX Graph quantization API
+- [Embeddings](https://docs.modular.com/max/inference/embeddings.md): Learn how to use the MAX embeddings endpoint to create embeddings for input text
+- [Image generation](https://docs.modular.com/max/inference/image-generation.md): Generate images from text prompts or transform existing images using the MAX v1/responses endpoint
+- [Image and video to text](https://docs.modular.com/max/inference/image-to-text.md): Use the MAX chat completions endpoint with image or video input to generate descriptions and answer questions about visual content
+- [Text to text](https://docs.modular.com/max/inference/text-to-text.md): Generate text using MAX with OpenAI-compatible chat and completion endpoints
+- [Video generation](https://docs.modular.com/max/inference/video-generation.md): Generate videos from text prompts or animate existing images using the MAX v1/responses endpoint
+- [What is Modular](https://docs.modular.com/max/intro.md): An overview of the Modular platform, what it does, and how to use it.
+- [Supported models](https://docs.modular.com/max/models.md): See all the model architectures supported by MAX.
+- [Packages](https://docs.modular.com/max/packages.md): Learn how to install Modular tools, set up your environment, and choose between nightly and stable versions
+- [REST API](https://docs.modular.com/max/rest-api.md): The API reference for the MAX inference endpoint.
+- [Function calling and tool use](https://docs.modular.com/max/serve/function-calling.md): Implement OpenAI-compatible function calling and tool use for agentic GenAI workflows
+- [Using LoRA adapters](https://docs.modular.com/max/serve/lora-adapters.md): Use LoRA adapters with MAX to serve task-specific, fine-tuned variants of LLMs
+- [Prefix caching with PagedAttention](https://docs.modular.com/max/serve/prefix-caching.md): Use prefix caching and PagedAttention when serving a model with the MAX CLI
+- [Speculative decoding](https://docs.modular.com/max/serve/speculative-decoding.md): Use speculative decoding to accelerate LLM inference
+- [Structured output](https://docs.modular.com/max/serve/structured-output.md): Enable structured output with your GenAI deployments for predictable responses
+- [Pixi basics](https://docs.modular.com/pixi.md): Pixi is a CLI tool [from Prefix.dev](https://prefix.dev/blog/launching_pixi)

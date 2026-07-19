@@ -1,0 +1,107 @@
+# MAX Python API Documentation
+
+> The MAX Python API reference (package indexes).
+
+This file contains links to documentation sections following the llmstxt.org standard.
+
+## Table of Contents
+
+- [max.driver](https://docs.modular.com/max/api/python/driver.md): | [`Accelerator`](generated/max.driver.Accelerator.md#max.driver.Accelerator)          | Creates an accelerator device with the specified ID and me...
+- [max.dtype](https://docs.modular.com/max/api/python/dtype.md): | [`DType`](generated/max.dtype.DType.md#max.dtype.DType) | The tensor data type.                                                                  ...
+- [max.engine](https://docs.modular.com/max/api/python/engine.md): Modular engine provides methods to load and execute AI models.
+- [max.experimental.functional](https://docs.modular.com/max/api/python/experimental.functional.md): Distributed functional ops with explicit per-op SPMD dispatch.
+- [max.experimental](https://docs.modular.com/max/api/python/experimental.md): Experimental APIs for building, sharding, and running ML workloads.
+- [max.experimental.nn](https://docs.modular.com/max/api/python/experimental.nn.md): Module framework for [`max.experimental`](experimental.md#module-max.experimental).
+- [max.experimental.nn.norm](https://docs.modular.com/max/api/python/experimental.nn.norm.md): Normalization layers for MAX neural networks.
+- [max.experimental.nn.rope](https://docs.modular.com/max/api/python/experimental.nn.rope.md): Positional embedding modules and functions.
+- [max.experimental.sharding](https://docs.modular.com/max/api/python/experimental.sharding.md): Distributed-tensor sharding: how a tensor is laid out across a device mesh.
+- [max.experimental.tensor](https://docs.modular.com/max/api/python/experimental.tensor.md): Provides tensor operations with eager execution capabilities.
+- [max.experimental.torch](https://docs.modular.com/max/api/python/experimental.torch.md): | [`CustomOpLibrary`](generated/max.experimental.torch.CustomOpLibrary.md#max.experimental.torch.CustomOpLibrary) | A PyTorch interface to custom o...
+- [max.graph](https://docs.modular.com/max/api/python/graph.md): APIs to build inference graphs for MAX.
+- [max.graph.ops](https://docs.modular.com/max/api/python/graph.ops.md): Implements operations used when staging a graph.
+- [max.graph.quantization](https://docs.modular.com/max/api/python/graph.quantization.md): Defines quantization encodings and configuration types for MAX graph weights.
+- [max.graph.weights](https://docs.modular.com/max/api/python/graph.weights.md): | [`WeightData`](generated/max.graph.weights.WeightData.md#max.graph.weights.WeightData)             | Container for weight tensor data with metada...
+- [max](https://docs.modular.com/max/api/python.md): The MAX Python API reference.
+- [max.nn.attention](https://docs.modular.com/max/api/python/nn.attention.md): The attention mechanism used within the model.
+- [max.nn.kernels](https://docs.modular.com/max/api/python/nn.kernels.md): Helper functions for wrapping custom kv cache/attention related ops.
+- [max.nn.kv_cache](https://docs.modular.com/max/api/python/nn.kv_cache.md): | [`KVCacheBuffer`](generated/max.nn.kv_cache.KVCacheBuffer.md#max.nn.kv_cache.KVCacheBuffer)                                     | A collection of...
+- [max.nn](https://docs.modular.com/max/api/python/nn.md): Neural network modules for MAX.
+- [max.pipelines.architectures.bert](https://docs.modular.com/max/api/python/pipelines.architectures.bert.md): BERT sentence transformer architecture for embeddings generation.
+- [max.pipelines.architectures.deepseekV2](https://docs.modular.com/max/api/python/pipelines.architectures.deepseekV2.md): DeepSeek-V2 mixture-of-experts architecture for text generation.
+- [max.pipelines.architectures.deepseekV3](https://docs.modular.com/max/api/python/pipelines.architectures.deepseekV3.md): DeepSeek-V3 mixture-of-experts architecture for text generation.
+- [max.pipelines.architectures.deepseekV3_2](https://docs.modular.com/max/api/python/pipelines.architectures.deepseekV3_2.md): DeepSeek-V3.2 mixture-of-experts architecture for text generation.
+- [max.pipelines.architectures.deepseekV3_nextn](https://docs.modular.com/max/api/python/pipelines.architectures.deepseekV3_nextn.md): DeepSeek-V3 NextN multi-token prediction draft model for speculative decoding.
+- [max.pipelines.architectures.dflash_llama3](https://docs.modular.com/max/api/python/pipelines.architectures.dflash_llama3.md): DFlash draft model for Llama3-family targets.
+- [max.pipelines.architectures.diffusion_gemma](https://docs.modular.com/max/api/python/pipelines.architectures.diffusion_gemma.md): DiffusionGemma block-diffusion architecture.
+- [max.pipelines.architectures.eagle3_deepseekV3](https://docs.modular.com/max/api/python/pipelines.architectures.eagle3_deepseekV3.md): DeepseekV3 + Eagle3 speculator pipeline.
+- [max.pipelines.architectures.eagle_llama3](https://docs.modular.com/max/api/python/pipelines.architectures.eagle_llama3.md): EAGLE speculative decoding draft model for Llama 3.
+- [max.pipelines.architectures.exaone](https://docs.modular.com/max/api/python/pipelines.architectures.exaone.md): EXAONE architecture, builds on [`llama3`](pipelines.architectures.llama3.md#module-max.pipelines.architectures.llama3).
+- [max.pipelines.architectures.flux2](https://docs.modular.com/max/api/python/pipelines.architectures.flux2.md): FLUX.2 diffusion architecture for image generation.
+- [max.pipelines.architectures.gemma3](https://docs.modular.com/max/api/python/pipelines.architectures.gemma3.md): Gemma 3 transformer architecture for text generation.
+- [max.pipelines.architectures.gemma3multimodal](https://docs.modular.com/max/api/python/pipelines.architectures.gemma3multimodal.md): Gemma 3 vision-language architecture for multimodal text generation.
+- [max.pipelines.architectures.gemma4](https://docs.modular.com/max/api/python/pipelines.architectures.gemma4.md): Gemma 4 vision-language architecture for multimodal text generation.
+- [max.pipelines.architectures.gemma4_assistant](https://docs.modular.com/max/api/python/pipelines.architectures.gemma4_assistant.md): <blockquote>
+- [max.pipelines.architectures.glm5_1](https://docs.modular.com/max/api/python/pipelines.architectures.glm5_1.md): GLM-5.1 (GlmMoeDsa) mixture-of-experts architecture for text generation.
+- [max.pipelines.architectures.gpt_oss](https://docs.modular.com/max/api/python/pipelines.architectures.gpt_oss.md): GPT-OSS mixture-of-experts architecture for text generation.
+- [max.pipelines.architectures.granite](https://docs.modular.com/max/api/python/pipelines.architectures.granite.md): Granite architecture, builds on [`llama3`](pipelines.architectures.llama3.md#module-max.pipelines.architectures.llama3).
+- [max.pipelines.architectures.hy_v3](https://docs.modular.com/max/api/python/pipelines.architectures.hy_v3.md): Tencent Hunyuan Hy3-preview (HYV3ForCausalLM).
+- [max.pipelines.architectures.idefics3](https://docs.modular.com/max/api/python/pipelines.architectures.idefics3.md): Idefics3 vision-language architecture for multimodal text generation.
+- [max.pipelines.architectures.ideogram4](https://docs.modular.com/max/api/python/pipelines.architectures.ideogram4.md): Ideogram 4 flow-matching text-to-image architecture.
+- [max.pipelines.architectures.internvl](https://docs.modular.com/max/api/python/pipelines.architectures.internvl.md): InternVL vision-language architecture for multimodal text generation.
+- [max.pipelines.architectures.kimik2_5](https://docs.modular.com/max/api/python/pipelines.architectures.kimik2_5.md): Kimi K2.5 mixture-of-experts architecture for text generation.
+- [max.pipelines.architectures.laguna](https://docs.modular.com/max/api/python/pipelines.architectures.laguna.md): <blockquote>
+- [max.pipelines.architectures.lfm2](https://docs.modular.com/max/api/python/pipelines.architectures.lfm2.md): <blockquote>
+- [max.pipelines.architectures.llama3](https://docs.modular.com/max/api/python/pipelines.architectures.llama3.md): Llama 3 transformer architecture for text generation.
+- [max.pipelines.architectures.llama4](https://docs.modular.com/max/api/python/pipelines.architectures.llama4.md): Llama 4 (text-only) transformer architecture for text generation.
+- [max.pipelines.architectures.mamba](https://docs.modular.com/max/api/python/pipelines.architectures.mamba.md): Mamba state-space architecture for text generation.
+- [max.pipelines.architectures](https://docs.modular.com/max/api/python/pipelines.architectures.md): MAX includes built-in support for a wide range of model architectures. Each
+- [max.pipelines.architectures.minimax_m2](https://docs.modular.com/max/api/python/pipelines.architectures.minimax_m2.md): <blockquote>
+- [max.pipelines.architectures.mistral](https://docs.modular.com/max/api/python/pipelines.architectures.mistral.md): Mistral transformer architecture for text generation.
+- [max.pipelines.architectures.mistral3](https://docs.modular.com/max/api/python/pipelines.architectures.mistral3.md): Mistral 3 vision-language architecture for multimodal text generation.
+- [max.pipelines.architectures.mpnet](https://docs.modular.com/max/api/python/pipelines.architectures.mpnet.md): MPNet sentence transformer architecture for embeddings generation.
+- [max.pipelines.architectures.nemotron_h](https://docs.modular.com/max/api/python/pipelines.architectures.nemotron_h.md): <blockquote>
+- [max.pipelines.architectures.olmo](https://docs.modular.com/max/api/python/pipelines.architectures.olmo.md): OLMo transformer architecture for text generation.
+- [max.pipelines.architectures.olmo2](https://docs.modular.com/max/api/python/pipelines.architectures.olmo2.md): OLMo 2 transformer architecture for text generation.
+- [max.pipelines.architectures.olmo3](https://docs.modular.com/max/api/python/pipelines.architectures.olmo3.md): OLMo 3 transformer architecture for text generation.
+- [max.pipelines.architectures.phi3](https://docs.modular.com/max/api/python/pipelines.architectures.phi3.md): Phi-3 transformer architecture for text generation.
+- [max.pipelines.architectures.pixtral](https://docs.modular.com/max/api/python/pipelines.architectures.pixtral.md): Pixtral vision-language architecture for multimodal text generation.
+- [max.pipelines.architectures.qwen2](https://docs.modular.com/max/api/python/pipelines.architectures.qwen2.md): Qwen2 transformer architecture for text generation.
+- [max.pipelines.architectures.qwen2_5vl](https://docs.modular.com/max/api/python/pipelines.architectures.qwen2_5vl.md): Qwen2.5-VL vision-language architecture for multimodal text generation.
+- [max.pipelines.architectures.qwen3](https://docs.modular.com/max/api/python/pipelines.architectures.qwen3.md): Qwen3 transformer architecture for text generation.
+- [max.pipelines.architectures.qwen3_5](https://docs.modular.com/max/api/python/pipelines.architectures.qwen3_5.md): <blockquote>
+- [max.pipelines.architectures.qwen3_embedding](https://docs.modular.com/max/api/python/pipelines.architectures.qwen3_embedding.md): Qwen3 architecture for embeddings generation.
+- [max.pipelines.architectures.qwen3vl_moe](https://docs.modular.com/max/api/python/pipelines.architectures.qwen3vl_moe.md): Qwen3-VL vision-language architecture for multimodal text generation.
+- [max.pipelines.architectures.qwen_image](https://docs.modular.com/max/api/python/pipelines.architectures.qwen_image.md): Qwen-Image diffusion architecture for image generation.
+- [max.pipelines.architectures.qwen_image_edit](https://docs.modular.com/max/api/python/pipelines.architectures.qwen_image_edit.md): Qwen-Image-Edit diffusion architecture for image editing.
+- [max.pipelines.architectures.step3p5](https://docs.modular.com/max/api/python/pipelines.architectures.step3p5.md): <blockquote>
+- [max.pipelines.architectures.unified_dflash_kimi_k25](https://docs.modular.com/max/api/python/pipelines.architectures.unified_dflash_kimi_k25.md): DFlash speculative decoding for Kimi K2.5 with unified graph compilation.
+- [max.pipelines.architectures.unified_dflash_llama3](https://docs.modular.com/max/api/python/pipelines.architectures.unified_dflash_llama3.md): DFlash speculative decoding for Llama3 with unified graph compilation.
+- [max.pipelines.architectures.unified_eagle_llama3](https://docs.modular.com/max/api/python/pipelines.architectures.unified_eagle_llama3.md): EAGLE speculative decoding draft model for Llama 3 with unified graph compilation.
+- [max.pipelines.architectures.unified_mtp_deepseekV3](https://docs.modular.com/max/api/python/pipelines.architectures.unified_mtp_deepseekV3.md): DeepSeek-V3 multi-token prediction draft model for speculative decoding with unified graph compilation.
+- [max.pipelines.architectures.unified_mtp_gemma4](https://docs.modular.com/max/api/python/pipelines.architectures.unified_mtp_gemma4.md): Gemma4 with MTP draft model for speculative decoding with unified graph compilation.
+- [max.pipelines.architectures.unified_mtp_glm5_2](https://docs.modular.com/max/api/python/pipelines.architectures.unified_mtp_glm5_2.md): GLM-5.2 (DeepSeek-V3.2 sparse) MTP draft model for unified speculative decoding.
+- [max.pipelines.architectures.wan](https://docs.modular.com/max/api/python/pipelines.architectures.wan.md): Wan diffusion architecture for video generation.
+- [max.pipelines.context](https://docs.modular.com/max/api/python/pipelines.context.md): | [`TextContext`](generated/max.pipelines.context.TextContext.md#max.pipelines.context.TextContext)                            | A base class for m...
+- [max.pipelines.diffusion](https://docs.modular.com/max/api/python/pipelines.diffusion.md): Diffusion-specific pipeline components.
+- [max.pipelines.diffusion.schedulers](https://docs.modular.com/max/api/python/pipelines.diffusion.schedulers.md): | [`FlowMatchEulerDiscreteScheduler`](generated/max.pipelines.diffusion.schedulers.FlowMatchEulerDiscreteScheduler.md#max.pipelines.diffusion.sched...
+- [max.pipelines.kv_cache](https://docs.modular.com/max/api/python/pipelines.kv_cache.md): KV cache management for MAX pipelines.
+- [max.pipelines.lib.interfaces](https://docs.modular.com/max/api/python/pipelines.lib.interfaces.md): Interfaces for MAX pipelines.
+- [max.pipelines.lib.log_probabilities](https://docs.modular.com/max/api/python/pipelines.lib.log_probabilities.md): Builds computation graphs for log probabilities over batched input sequences.
+- [max.pipelines.lib](https://docs.modular.com/max/api/python/pipelines.lib.md): Types to interface with ML pipelines such as text/token generation.
+- [max.pipelines.lib.registry](https://docs.modular.com/max/api/python/pipelines.lib.registry.md): Model registry, for tracking various model variants.
+- [max.pipelines.logging_utils](https://docs.modular.com/max/api/python/pipelines.logging_utils.md): Pipeline logging utilities.
+- [max.pipelines.lora](https://docs.modular.com/max/api/python/pipelines.lora.md): LoRA adapter management for MAX pipelines.
+- [max.pipelines](https://docs.modular.com/max/api/python/pipelines.md): Types to interface with ML pipelines such as text/token/pixel generation.
+- [max.pipelines.modeling.base](https://docs.modular.com/max/api/python/pipelines.modeling.base.md): Base classes for MAX pipeline model definitions.
+- [max.pipelines.modeling.dataprocessing](https://docs.modular.com/max/api/python/pipelines.modeling.dataprocessing.md): | [`PaddingDirection`](generated/max.pipelines.modeling.dataprocessing.PaddingDirection.md#max.pipelines.modeling.dataprocessing.PaddingDirection) ...
+- [max.pipelines.modeling.types](https://docs.modular.com/max/api/python/pipelines.modeling.types.md): Pipeline modeling types: request/input/pipeline interfaces.
+- [max.pipelines.modeling.types.pipeline_variants](https://docs.modular.com/max/api/python/pipelines.modeling.types.pipeline_variants.md): | [`BatchType`](generated/max.pipelines.modeling.types.pipeline_variants.BatchType.md#max.pipelines.modeling.types.pipeline_variants.BatchType)    ...
+- [max.pipelines.request](https://docs.modular.com/max/api/python/pipelines.request.md): Request types for MAX API.
+- [max.pipelines.request.provider_options](https://docs.modular.com/max/api/python/pipelines.request.provider_options.md): Provider-specific options for MAX platform and modalities.
+- [max.pipelines.sampling](https://docs.modular.com/max/api/python/pipelines.sampling.md): | [`SamplingConfig`](generated/max.pipelines.sampling.SamplingConfig.md#max.pipelines.sampling.SamplingConfig) | Configuration for the sampling sta...
+- [max.pipelines.speculative](https://docs.modular.com/max/api/python/pipelines.speculative.md): Speculative decoding pipelines and configuration for MAX.
+- [max.pipelines.weights](https://docs.modular.com/max/api/python/pipelines.weights.md): Weight loading utilities for MAX pipelines.
+- [max.profiler.cpu](https://docs.modular.com/max/api/python/profiler.cpu.md): CPU diagnostics API.
+- [max.profiler.gpu](https://docs.modular.com/max/api/python/profiler.gpu.md): GPU diagnostics API.
+- [max.profiler](https://docs.modular.com/max/api/python/profiler.md): Performance profiling and tracing utilities for MAX.
+- [max.support.image](https://docs.modular.com/max/api/python/support.image.md): Image-related utilities.
