@@ -8,3 +8,4 @@ version = "0.1.0"
 
 [dependencies]
 mojo = ">=1.0.0b2,<2"
+numpy = ">=1.24"
