@@ -104,7 +104,8 @@ class RootNode:
     def _connect_worker(self, host, port, max_retries=10, delay=0.2):
         for attempt in range(max_retries):
             try:
-                conn = socket.create_connection((host, port), timeout=5)
+                conn = socket.create_connection((host, port), timeout=10)
+                conn.settimeout(120.0)
                 return conn
             except ConnectionRefusedError:
                 if attempt < max_retries - 1:

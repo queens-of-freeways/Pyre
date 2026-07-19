@@ -45,14 +45,15 @@ class WorkerNode:
         self.hidden_dim = None
 
     def start(self):
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((self.host, self.port))
-        server.listen(1)
-
-        conn, addr = server.accept()
-
         try:
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((self.host, self.port))
+            server.listen(1)
+
+            conn, addr = server.accept()
+            conn.settimeout(60.0)
+
             msg_type, obj = self._recv_msg(conn)
             if msg_type != MSG_SHARD_SPEC:
                 raise ValueError(f"Expected SHARD_SPEC, got {msg_type}")
@@ -102,9 +103,18 @@ class WorkerNode:
                 )
 
                 self._send_msg(conn, MSG_FORWARD_RESULT, partial.to_numpy())
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
         finally:
-            conn.close()
-            server.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                server.close()
+            except Exception:
+                pass
 
     def _send_msg(self, conn, msg_type, obj=None):
         payload = pickle.dumps(obj) if obj is not None else b""
