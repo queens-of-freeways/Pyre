@@ -7,7 +7,7 @@ breaking two original limits:
 
 ## Build & test
 - Build:   `pixi run mojo build src/`
-- Test:    `pixi run mojo test tests/`
+- Test:    `pixi run mojo run tests/`
 - Format:  `pixi run mojo format src/`
 
 ## Critical architectural constraint
