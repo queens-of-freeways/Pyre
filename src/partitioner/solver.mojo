@@ -15,10 +15,14 @@ struct NodeCap(Movable):
 struct ShardSpec(Movable):
     var start: Int
     var end: Int
+    var seq_start: Int
+    var seq_end: Int
 
-    def __init__(out self, start: Int, end: Int):
+    def __init__(out self, start: Int, end: Int, seq_start: Int = 0, seq_end: Int = 0):
         self.start = start
         self.end = end
+        self.seq_start = seq_start
+        self.seq_end = seq_end
 
     def size(self) -> Int:
         return self.end - self.start
