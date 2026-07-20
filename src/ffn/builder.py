@@ -24,21 +24,31 @@ def build_ffn_graph(
     *,
     seq_len: int = 1,
     name: str = "ffn_shard",
+    gated: bool = False,
 ) -> Graph:
     width = shard.ffn_width()
     if width <= 0:
         raise ValueError(f"ShardSpec width must be positive, got {width}")
 
     x_type = TensorType(DType.float32, [1, seq_len, hidden_dim], device=device)
-    ffn_up_slice_type = TensorType(DType.float32, [hidden_dim, width], device=device)
-    ffn_down_slice_type = TensorType(DType.float32, [width, hidden_dim], device=device)
+    up_slice_type = TensorType(DType.float32, [hidden_dim, width], device=device)
+    down_slice_type = TensorType(DType.float32, [width, hidden_dim], device=device)
 
-    with Graph(name, input_types=[x_type, ffn_up_slice_type, ffn_down_slice_type]) as g:
-        x, ffn_up_slice, ffn_down_slice = g.inputs
-        h = ops.matmul(x, ffn_up_slice)
-        h = ops.silu(h)
-        partial = ops.matmul(h, ffn_down_slice)
-        g.output(partial)
+    if gated:
+        gate_slice_type = TensorType(DType.float32, [hidden_dim, width], device=device)
+        with Graph(name, input_types=[x_type, gate_slice_type, up_slice_type, down_slice_type]) as g:
+            x, gate_w, up_w, down_w = g.inputs
+            gate = ops.silu(ops.matmul(x, gate_w))
+            up = ops.matmul(x, up_w)
+            h = gate * up
+            partial = ops.matmul(h, down_w)
+            g.output(partial)
+    else:
+        with Graph(name, input_types=[x_type, up_slice_type, down_slice_type]) as g:
+            x, up_w, down_w = g.inputs
+            h = ops.silu(ops.matmul(x, up_w))
+            partial = ops.matmul(h, down_w)
+            g.output(partial)
 
     return g
 

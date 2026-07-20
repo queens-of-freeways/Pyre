@@ -2,3 +2,8 @@
 .pixi/*
 !.pixi/config.toml
 .aider*
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/

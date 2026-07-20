@@ -15,13 +15,14 @@ from src.orchestrator.generator import Generator
 from src.orchestrator.llama_loader import (
     get_smollm_config,
     create_synthetic_weights,
+    load_real_weights,
     slice_weights_for_node,
     validate_weight_shapes,
 )
 
 
 def _run_worker(port):
-    worker = WorkerNode(host="localhost", port=port)
+    worker = WorkerNode(host="localhost", port=port, use_mdns=False)
     worker.start()
 
 
@@ -51,9 +52,9 @@ def test_weight_slicing():
     print("test_weight_slicing passed!")
 
 
-def test_distributed_generation():
+def _run_generation(use_real_weights: bool, ports=(9101, 9102), max_tokens=5):
     procs = []
-    for port in [9101, 9102]:
+    for port in ports:
         p = multiprocessing.Process(target=_run_worker, args=(port,))
         p.start()
         procs.append(p)
@@ -65,20 +66,22 @@ def test_distributed_generation():
             hidden_dim=576, n_heads=9, n_kv_heads=3,
             head_dim=64, ffn_dim=1536,
         )
-        root = RootNode([("localhost", 9101), ("localhost", 9102)], model_config)
+        root = RootNode([("localhost", p) for p in ports], model_config)
 
         smollm_config = get_smollm_config()
-        full_weights = create_synthetic_weights(smollm_config)
+        if use_real_weights:
+            full_weights = load_real_weights()
+        else:
+            full_weights = create_synthetic_weights(smollm_config)
 
         node_weights = {}
         for node_id in root.partitions:
             p = root.partitions[node_id]
             shard = {"id": node_id, "ffn_start": p["ffn_start"], "ffn_end": p["ffn_end"]}
-            sliced = slice_weights_for_node(shard, full_weights, 3, smollm_config)
+            sliced = slice_weights_for_node(shard, full_weights, len(ports), smollm_config)
             node_weights[node_id] = sliced
 
         validate_weight_shapes(node_weights, root.partitions, smollm_config)
-        print("Weight shape validation passed!")
 
         lm_head = full_weights["lm_head"]
         embedding = full_weights["embedding"]
@@ -88,12 +91,12 @@ def test_distributed_generation():
             tokenizer.pad_token = tokenizer.eos_token
 
         gen = Generator(root, tokenizer, lm_head, embedding, seq_len=64)
-        output = gen.generate("Hello, my name is", max_tokens=1)
+        output = gen.generate("Hello, my name is", max_tokens=max_tokens)
 
         assert isinstance(output, str), f"Expected string, got {type(output)}"
         assert len(output) > 0, "Expected non-empty output"
-        print(f"Generated output: {repr(output)}")
-        print("test_distributed_generation passed!")
+        print(f"Generated output ({'real' if use_real_weights else 'synthetic'}): {repr(output)}")
+        return output
 
     finally:
         root.shutdown()
@@ -102,7 +105,17 @@ def test_distributed_generation():
             p.join(timeout=5)
 
 
+def test_distributed_generation_synthetic():
+    _run_generation(use_real_weights=False, max_tokens=1)
+    print("test_distributed_generation_synthetic passed!")
+
+
+def test_distributed_generation_real():
+    output = _run_generation(use_real_weights=True, max_tokens=5)
+    print("test_distributed_generation_real passed!")
+
+
 if __name__ == "__main__":
     test_weight_slicing()
-    test_distributed_generation()
+    test_distributed_generation_synthetic()
     print("All generation tests passed!")

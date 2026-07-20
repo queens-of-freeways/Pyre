@@ -12,7 +12,7 @@ from src.orchestrator.worker_node import WorkerNode
 
 
 def _run_worker(port):
-    worker = WorkerNode(host="localhost", port=port)
+    worker = WorkerNode(host="localhost", port=port, use_mdns=False)
     worker.start()
 
 

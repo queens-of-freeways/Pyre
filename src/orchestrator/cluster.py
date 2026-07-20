@@ -26,6 +26,41 @@ class ModelConfig:
     n_kv_heads: int
     head_dim: int
     ffn_dim: int
+    num_layers: int = 1
+    vocab_size: int = 49152
+    model_type: str = "llama"
+    ple_dim: int = 0  # PLE dimension (Gemma 4 E-series only)
+
+    @staticmethod
+    def from_hf(model_id: str) -> "ModelConfig":
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(model_id)
+
+        hidden_dim = getattr(cfg, "hidden_size", getattr(cfg, "hidden_dim", None))
+        n_heads = getattr(cfg, "num_attention_heads", getattr(cfg, "num_heads", None))
+        n_kv_heads = getattr(cfg, "num_key_value_heads", n_heads)
+        head_dim = getattr(cfg, "head_dim", None) or (hidden_dim // n_heads)
+        ffn_dim = getattr(cfg, "intermediate_size", getattr(cfg, "ffn_dim", None))
+        num_layers = getattr(cfg, "num_hidden_layers", getattr(cfg, "num_layers", 1))
+        vocab_size = getattr(cfg, "vocab_size", 49152)
+        model_type = getattr(cfg, "model_type", "llama")
+
+        if any(v is None for v in [hidden_dim, n_heads, head_dim, ffn_dim]):
+            raise ValueError(f"Could not infer all model dimensions from {model_id} config")
+
+        ple_dim = getattr(cfg, "hidden_size_per_layer_input", 0)
+
+        return ModelConfig(
+            hidden_dim=hidden_dim,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            ffn_dim=ffn_dim,
+            num_layers=num_layers,
+            vocab_size=vocab_size,
+            model_type=model_type,
+            ple_dim=ple_dim,
+        )
 
 class ClusterOrchestrator:
     def __init__(self, nodes: List[NodeCap], config: ModelConfig):

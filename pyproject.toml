@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyre"
+version = "0.1.0"
+description = "Distributed LLM inference across machines"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["pyre*"]
+
+[project.scripts]
+pyre = "pyre.cli:main"
