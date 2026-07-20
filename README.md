@@ -6,13 +6,13 @@ Run large language models across multiple machines, breaking the memory and comp
 
 ```bash
 # One command — auto-starts a local worker, no separate terminal needed
-pixi run pyre run --model HuggingFaceTB/SmolLM-135M --prompt "Hello" --max-tokens 10
+pyre run --model HuggingFaceTB/SmolLM-135M --prompt "Hello" --max-tokens 10
 
 # With remote workers
-pixi run pyre run --model mistralai/Mistral-7B-v0.3 --workers 10.0.0.5:9001,10.0.0.6:9002
+pyre run --model mistralai/Mistral-7B-v0.3 --workers 10.0.0.5:9001,10.0.0.6:9002
 
 # List workers via mDNS
-pixi run pyre ps
+pyre ps
 ```
 
 ## Install
@@ -26,9 +26,10 @@ pixi run pyre ps
 git clone https://github.com/queens-of-freeways/Pyre.git
 cd Pyre
 pixi install
+ln -sf "$PWD/.pixi/envs/default/bin/pyre" ~/.local/bin/pyre
 ```
 
-That's it — pixi pulls Mojo, Python, PyTorch, transformers, zeroconf, and the MAX SDK automatically.
+That's it — pixi pulls Mojo, Python, PyTorch, transformers, zeroconf, and the MAX SDK automatically. The last line makes `pyre` available on your PATH.
 
 ## Usage
 
@@ -49,13 +50,13 @@ Starts a local worker by default (the root machine also contributes compute).
 
 ```bash
 # Local only
-pixi run pyre run --model HuggingFaceTB/SmolLM-135M --prompt "Once upon a time"
+pyre run --model HuggingFaceTB/SmolLM-135M --prompt "Once upon a time"
 
 # Explicit remote workers
-pixi run pyre run --model Qwen/Qwen2.5-0.5B --workers 192.168.1.5:9001 --prompt "Hello"
+pyre run --model Qwen/Qwen2.5-0.5B --workers 192.168.1.5:9001 --prompt "Hello"
 
 # mDNS auto-discovery + local worker
-pixi run pyre run --model mistralai/Mistral-7B-v0.3 --prompt "The answer is"
+pyre run --model mistralai/Mistral-7B-v0.3 --prompt "The answer is"
 ```
 
 ### `pyre worker` — Start a remote worker node
@@ -63,7 +64,7 @@ pixi run pyre run --model mistralai/Mistral-7B-v0.3 --prompt "The answer is"
 Run on each machine that contributes compute:
 
 ```bash
-pixi run pyre worker --host 0.0.0.0 --port 9001
+pyre worker --host 0.0.0.0 --port 9001
 ```
 
 | Flag | Default | Description |
@@ -75,7 +76,7 @@ pixi run pyre worker --host 0.0.0.0 --port 9001
 ### `pyre ps` — List running workers
 
 ```bash
-pixi run pyre ps
+pyre ps
 ```
 
 ### HuggingFace Login (for gated models)
