@@ -152,9 +152,13 @@ class RootNode:
         return exp / np.sum(exp, axis=axis, keepdims=True)
 
     @staticmethod
+    def _rms_norm(x, weight, eps=1e-6):
+        variance = np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True)
+        x_norm = x / np.sqrt(variance + eps)
+        return (x_norm * weight).astype(np.float32)
+
+    @staticmethod
     def _apply_rope(x, rope_fraction=1.0, theta=10000.0):
-        if rope_fraction >= 1.0:
-            return x
         batch, n_heads, seq_len, head_dim = x.shape
         dims = int(head_dim * rope_fraction)
         if dims < 2:
@@ -207,8 +211,14 @@ class RootNode:
         rope_frac = props.get("rope_fraction", 1.0)
         use_vn = props.get("use_v_norm", False)
 
-        if rope_frac < 1.0:
-            k = self._apply_rope(k, rope_fraction=rope_frac)
+        if rope_frac > 0:
+            theta = getattr(self.config, 'rope_theta', 10000.0)
+            q = self._apply_rope(q, rope_fraction=rope_frac, theta=theta)
+            k = self._apply_rope(k, rope_fraction=rope_frac, theta=theta)
+
+        q = np.clip(q, -1000, 1000)
+        k = np.clip(k, -1000, 1000)
+        v = np.clip(v, -1000, 1000)
 
         if use_vn:
             v = self._apply_v_norm(v)
@@ -219,6 +229,7 @@ class RootNode:
 
         scale = np.float32(np.sqrt(head_dim))
         scores = q @ k_exp.transpose(0, 1, 3, 2) / scale
+        scores = np.clip(scores, -500, 500)
         probs = self._softmax(scores, axis=-1)
         attn = probs @ v_exp
         attn = attn.transpose(0, 2, 1, 3).reshape(1, full_seq, n_heads * head_dim)
@@ -298,13 +309,23 @@ class RootNode:
         n_heads = self.config.n_heads
         n_kv = self.config.n_kv_heads
 
-        p0 = self.partitions[0]
-        x_root = x[:, p0["seq_start"]:p0["seq_end"], :]
-
         root_w = {}
         if self.all_layer_weights and 0 in self.all_layer_weights:
             root_w = self.all_layer_weights[0].get(layer_idx, {})
         rw_attn = root_w.get("attn", {})
+
+        # ---- Pre-attention RMSNorm ----
+        input_ln = root_w.get("input_layernorm")
+        if input_ln is not None:
+            x_norm = self._rms_norm(x, input_ln)
+        else:
+            variance = np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True)
+            x_norm = (x / np.sqrt(variance + 1e-6)).astype(np.float32)
+
+        # ---- QKV projection on normed input ----
+        p0 = self.partitions[0]
+        x_root = x_norm[:, p0["seq_start"]:p0["seq_end"], :]
+
         layer_hd = root_w.get("_props", {}).get("head_dim", head_dim)
         wq_r = rw_attn.get("q", np.random.randn(hidden_dim, n_heads * layer_hd).astype(np.float32))
         wk_r = rw_attn.get("k", np.random.randn(hidden_dim, n_kv * layer_hd).astype(np.float32))
@@ -322,32 +343,50 @@ class RootNode:
         )
         all_qkv = {0: (q_root.to_numpy(), k_root.to_numpy(), v_root.to_numpy())}
 
+        # ---- Send normed slices to workers for QKV ----
         for idx, worker_id in enumerate(self.worker_ids):
+            p = self.partitions[worker_id]
+            x_worker = x_norm[:, p["seq_start"]:p["seq_end"], :]
             self._send_msg(
                 self.worker_conns[idx], MSG_FORWARD_DATA,
-                (layer_idx, x[:, self.partitions[worker_id]["seq_start"]:self.partitions[worker_id]["seq_end"], :]),
+                (layer_idx, x_worker),
             )
 
         for idx, worker_id in enumerate(self.worker_ids):
             _, qkv = self._recv_msg(self.worker_conns[idx])
             all_qkv[worker_id] = qkv
 
+        # ---- Attention (with RoPE applied inside) ----
         attn_out = self._compute_attention(all_qkv, layer_idx, kv_cache)
 
+        # Output projection
         o_weight = root_w.get("attn", {}).get("o")
         if o_weight is not None:
             attn_out = attn_out @ o_weight
 
+        # ---- Residual: h = x + attn_out ----
+        h = x + attn_out
+
+        # ---- Pre-FFN RMSNorm ----
+        post_attn_ln = root_w.get("post_attention_layernorm")
+        if post_attn_ln is not None:
+            h_norm = self._rms_norm(h, post_attn_ln)
+        else:
+            variance = np.mean(h.astype(np.float64) ** 2, axis=-1, keepdims=True)
+            h_norm = (h / np.sqrt(variance + 1e-6)).astype(np.float32)
+
+        # ---- Send normed slices to workers for FFN ----
         for idx, worker_id in enumerate(self.worker_ids):
             p = self.partitions[worker_id]
-            self._send_msg(self.worker_conns[idx], MSG_ATTN_OUTPUT, (attn_out[:, p["seq_start"]:p["seq_end"], :],))
+            self._send_msg(self.worker_conns[idx], MSG_ATTN_OUTPUT, (h_norm[:, p["seq_start"]:p["seq_end"], :],))
 
         partials = {}
         for idx, worker_id in enumerate(self.worker_ids):
             _, partial = self._recv_msg(self.worker_conns[idx])
             partials[worker_id] = partial
 
-        attn_root = attn_out[:, p0["seq_start"]:p0["seq_end"], :]
+        # ---- Root FFN on normed hidden ----
+        attn_root = h_norm[:, p0["seq_start"]:p0["seq_end"], :]
         width0 = p0["ffn_end"] - p0["ffn_start"]
 
         rw_ffn = root_w.get("ffn", {})
@@ -363,13 +402,17 @@ class RootNode:
         )
         partial_root = partial_root.to_numpy()
 
-        final_output = np.zeros((batch, seq_len, hidden_dim), dtype=np.float32)
-        final_output[:, p0["seq_start"]:p0["seq_end"], :] += partial_root
+        # ---- Sum FFN partials ----
+        ffn_out = np.zeros((batch, seq_len, hidden_dim), dtype=np.float32)
+        ffn_out[:, p0["seq_start"]:p0["seq_end"], :] += partial_root
         for worker_id in self.worker_ids:
             p = self.partitions[worker_id]
-            final_output[:, p["seq_start"]:p["seq_end"], :] += partials[worker_id]
+            ffn_out[:, p["seq_start"]:p["seq_end"], :] += partials[worker_id]
 
-        # Apply PLE after FFN + residual (Gemma 4 pattern: PLE is last block in decoder layer)
+        # ---- Residual: output = h + ffn_out ----
+        final_output = h + ffn_out
+
+        # ---- Apply PLE after FFN + residual (Gemma 4 pattern) ----
         if ple_slice is not None:
             ple_gate = root_w.get("ple_gate")
             if ple_gate is not None:

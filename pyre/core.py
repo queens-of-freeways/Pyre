@@ -13,7 +13,7 @@ def run_generation(
     workers=None,
     prompt="Hello, my name is",
     max_tokens=10,
-    layers=1,
+    layers=0,
     discover_timeout=3.0,
     expect_workers=None,
     local_worker=True,

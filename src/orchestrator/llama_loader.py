@@ -40,6 +40,8 @@ class LayerWeightSet:
     ffn_gate: np.ndarray   # [hidden_dim, ffn_dim]
     ffn_up: np.ndarray     # [hidden_dim, ffn_dim]
     ffn_down: np.ndarray   # [ffn_dim, hidden_dim]
+    input_layernorm: Optional[np.ndarray] = None      # [hidden_dim]
+    post_attention_layernorm: Optional[np.ndarray] = None  # [hidden_dim]
     has_v_proj: bool = True
     props: Optional[LayerProperties] = None
     # PLE (Per-Layer Embeddings) per-layer weights
@@ -61,6 +63,7 @@ class FullWeights:
     head_dim: int
     ffn_dim: int
     vocab_size: int
+    final_norm: Optional[np.ndarray] = None  # [hidden_dim]
     model_type: str = "llama"
     # PLE (Per-Layer Embeddings) — Gemma 4 E-series
     ple_embedding: Optional[np.ndarray] = None   # [ple_vocab_size, num_layers * ple_dim]
@@ -98,6 +101,21 @@ def _infer_weight_keys(state: Dict[str, torch.Tensor], model_type: str = "llama"
 
     def has(pat, keys=first_keys):
         return any(pat in k for k in keys)
+
+    # Detect norm key pattern
+    if has("input_layernorm.weight"):
+        input_norm_tmpl = "model.layers.{}.input_layernorm.weight"
+    elif has("attention_norm.weight"):
+        input_norm_tmpl = "model.layers.{}.attention_norm.weight"
+    else:
+        input_norm_tmpl = None
+
+    if has("post_attention_layernorm.weight"):
+        post_attn_norm_tmpl = "model.layers.{}.post_attention_layernorm.weight"
+    elif has("ffn_norm.weight"):
+        post_attn_norm_tmpl = "model.layers.{}.ffn_norm.weight"
+    else:
+        post_attn_norm_tmpl = None
 
     # Detect attention key pattern
     if has("self_attn.q_proj"):
@@ -164,6 +182,8 @@ def _infer_weight_keys(state: Dict[str, torch.Tensor], model_type: str = "llama"
         "embed_key": embed_key,
         "lm_head_key": lm_head_key,
         "norm_key": norm_key,
+        "input_norm_tmpl": input_norm_tmpl,
+        "post_attn_norm_tmpl": post_attn_norm_tmpl,
         "has_ple": has_ple,
         "ple_keys": ple_keys,
     }
@@ -197,6 +217,16 @@ def _load_layer_weights(
         up = fc1
         down = fc2
 
+    # Per-layer norm weights
+    input_norm = None
+    post_attn_norm = None
+    input_norm_tmpl = key_info.get("input_norm_tmpl")
+    if input_norm_tmpl:
+        input_norm = state[input_norm_tmpl.format(layer_idx)].to(torch.float32).cpu().numpy()
+    post_attn_norm_tmpl = key_info.get("post_attn_norm_tmpl")
+    if post_attn_norm_tmpl:
+        post_attn_norm = state[post_attn_norm_tmpl.format(layer_idx)].to(torch.float32).cpu().numpy()
+
     # PLE per-layer weights
     ple_gate = None
     ple_proj = None
@@ -209,6 +239,7 @@ def _load_layer_weights(
 
     return LayerWeightSet(q=q, k=k, v=v, ffn_gate=gate, ffn_up=up, ffn_down=down,
                           has_v_proj=has_v, o=o,
+                          input_layernorm=input_norm, post_attention_layernorm=post_attn_norm,
                           ple_gate=ple_gate, ple_proj=ple_proj, ple_post_norm=ple_post_norm)
 
 
@@ -233,6 +264,9 @@ def _load_full_weights(model_id: str, num_layers: Optional[int] = None) -> FullW
 
     lm_head = _torch_to_np(state[key_info["lm_head_key"]], transpose=False)
     embedding = _torch_to_np(state[key_info["embed_key"]], transpose=False)
+    final_norm = None
+    if key_info["norm_key"]:
+        final_norm = state[key_info["norm_key"]].to(torch.float32).cpu().numpy()
     vocab_size = embedding.shape[0]
 
     layer_weights = {}
@@ -301,6 +335,7 @@ def _load_full_weights(model_id: str, num_layers: Optional[int] = None) -> FullW
         layer_props=layer_props,
         embedding=embedding,
         lm_head=lm_head,
+        final_norm=final_norm,
         num_layers=n_layers,
         hidden_dim=hidden_dim,
         n_heads=n_heads,
@@ -429,6 +464,8 @@ class WeightProvider:
             "attn": attn,
             "ffn": ffn,
             "_props": props_dict,
+            "input_layernorm": lw.input_layernorm.copy() if lw.input_layernorm is not None else None,
+            "post_attention_layernorm": lw.post_attention_layernorm.copy() if lw.post_attention_layernorm is not None else None,
         }
         # Include PLE per-layer weights (root only)
         ple_g = lw.ple_gate
@@ -460,6 +497,9 @@ class WeightProvider:
     def get_lm_head(self) -> np.ndarray:
         return self.full.lm_head
 
+    def get_final_norm(self) -> Optional[np.ndarray]:
+        return self.full.final_norm
+
     def get_ple_embedding(self) -> Optional[np.ndarray]:
         return self.full.ple_embedding
 
@@ -485,7 +525,7 @@ SMOLM_135M_CONFIG = {
     "head_dim": 64,
     "ffn_dim": 1536,
     "vocab_size": 49152,
-    "num_layers": 8,
+    "num_layers": 30,
 }
 
 
@@ -503,6 +543,11 @@ def load_real_weights(model_name: str = "HuggingFaceTB/SmolLM-135M", layer_idx: 
             state[name].to(torch.float32).cpu().numpy().T.astype(np.float32)
         )
 
+    def _norm(name):
+        return np.ascontiguousarray(
+            state[name].to(torch.float32).cpu().numpy().astype(np.float32)
+        )
+
     weights = {
         "q_weight": _w(f"model.layers.{layer_idx}.self_attn.q_proj.weight"),
         "k_weight": _w(f"model.layers.{layer_idx}.self_attn.k_proj.weight"),
@@ -510,6 +555,8 @@ def load_real_weights(model_name: str = "HuggingFaceTB/SmolLM-135M", layer_idx: 
         "ffn_gate": _w(f"model.layers.{layer_idx}.mlp.gate_proj.weight"),
         "ffn_up": _w(f"model.layers.{layer_idx}.mlp.up_proj.weight"),
         "ffn_down": _w(f"model.layers.{layer_idx}.mlp.down_proj.weight"),
+        "input_layernorm": _norm(f"model.layers.{layer_idx}.input_layernorm.weight"),
+        "post_attention_layernorm": _norm(f"model.layers.{layer_idx}.post_attention_layernorm.weight"),
         "lm_head": np.ascontiguousarray(
             state.get("lm_head.weight", state["model.embed_tokens.weight"])
             .to(torch.float32).cpu().numpy().astype(np.float32)
@@ -517,6 +564,7 @@ def load_real_weights(model_name: str = "HuggingFaceTB/SmolLM-135M", layer_idx: 
         "embedding": np.ascontiguousarray(
             state["model.embed_tokens.weight"].to(torch.float32).cpu().numpy().astype(np.float32)
         ),
+        "final_norm": _norm("model.norm.weight"),
     }
     return weights
 
@@ -546,7 +594,11 @@ def create_synthetic_weights(config: dict) -> dict:
         "ffn_down": np.random.randn(ffn_dim, hidden_dim).astype(np.float32),
         "lm_head": np.random.randn(vocab_size, hidden_dim).astype(np.float32),
         "embedding": np.random.randn(vocab_size, hidden_dim).astype(np.float32),
+        "final_norm": np.random.randn(hidden_dim).astype(np.float32),
     }
+    for i in range(num_layers):
+        result[f"input_layernorm_{i}"] = np.random.randn(hidden_dim).astype(np.float32)
+        result[f"post_attention_layernorm_{i}"] = np.random.randn(hidden_dim).astype(np.float32)
     if ple_dim > 0:
         ple_vocab = config.get("ple_vocab_size", vocab_size)
         result["ple_embedding"] = np.random.randn(ple_vocab, num_layers * ple_dim).astype(np.float32)

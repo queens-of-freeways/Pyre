@@ -17,8 +17,8 @@ def main():
               help="Input prompt")
 @click.option("--max-tokens", default=10, type=int,
               help="Number of tokens to generate")
-@click.option("--layers", default=1, type=int,
-              help="Number of transformer layers to run")
+@click.option("--layers", default=0, type=int,
+              help="Number of transformer layers (0 = auto, all layers)")
 @click.option("--discover-timeout", default=3.0, type=float,
               help="Seconds to wait for mDNS worker discovery")
 @click.option("--expect-workers", default=None, type=int,

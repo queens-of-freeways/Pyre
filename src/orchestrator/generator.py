@@ -23,6 +23,7 @@ class Generator:
         embedding: np.ndarray,
         seq_len: int = 64,
         has_ple: bool = False,
+        final_norm: Optional[np.ndarray] = None,
     ):
         self.root = root
         self.tokenizer = tokenizer
@@ -30,11 +31,19 @@ class Generator:
         self.embedding = embedding
         self.seq_len = seq_len
         self.has_ple = has_ple
+        self.final_norm = final_norm
 
     def _embed(self, input_ids: np.ndarray) -> np.ndarray:
         return self.embedding[input_ids]
 
+    def _rms_norm(self, x, eps=1e-6):
+        variance = np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True)
+        x_norm = x / np.sqrt(variance + eps)
+        return (x_norm * self.final_norm).astype(np.float32)
+
     def _compute_logits(self, hidden_states: np.ndarray) -> np.ndarray:
+        if self.final_norm is not None:
+            hidden_states = self._rms_norm(hidden_states)
         return hidden_states @ self.lm_head.T
 
     def generate(self, prompt: str, max_tokens: int = 1, stream: bool = False) -> str:
@@ -92,7 +101,7 @@ def _parse_workers(workers_str: str) -> List[Tuple[str, int]]:
 def _build_gen(
     worker_addrs: List[Tuple[str, int]],
     model: str = "HuggingFaceTB/SmolLM-135M",
-    num_layers: int = 1,
+    num_layers: int = 0,
     real_weights: bool = False,
 ) -> Generator:
     from transformers import AutoTokenizer
@@ -100,6 +109,9 @@ def _build_gen(
     from src.orchestrator.llama_loader import WeightProvider
 
     config = ModelConfig.from_hf(model)
+
+    if num_layers <= 0:
+        num_layers = config.num_layers
 
     total_nodes = 1 + len(worker_addrs)
     ffn_chunk = config.ffn_dim // total_nodes
@@ -144,6 +156,7 @@ def _build_gen(
         embedding=wp.get_embedding(),
         seq_len=64,
         has_ple=has_ple,
+        final_norm=wp.get_final_norm(),
     )
 
 
@@ -159,7 +172,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--prompt", type=str, default="Hello, my name is", help="Input prompt")
     parser.add_argument("--max-tokens", type=int, default=10, help="Number of tokens to generate")
-    parser.add_argument("--layers", type=int, default=1, help="Number of transformer layers to run")
+    parser.add_argument("--layers", type=int, default=0, help="Number of transformer layers (0 = auto, all layers)")
     parser.add_argument(
         "--local-worker", action="store_true",
         help="Start a worker on this machine (avoids needing a separate terminal)",

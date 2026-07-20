@@ -30,6 +30,7 @@ class ModelConfig:
     vocab_size: int = 49152
     model_type: str = "llama"
     ple_dim: int = 0  # PLE dimension (Gemma 4 E-series only)
+    rope_theta: float = 10000.0
 
     @staticmethod
     def from_hf(model_id: str) -> "ModelConfig":
@@ -49,6 +50,7 @@ class ModelConfig:
             raise ValueError(f"Could not infer all model dimensions from {model_id} config")
 
         ple_dim = getattr(cfg, "hidden_size_per_layer_input", 0)
+        rope_theta = getattr(cfg, "rope_theta", 10000.0)
 
         return ModelConfig(
             hidden_dim=hidden_dim,
@@ -60,6 +62,7 @@ class ModelConfig:
             vocab_size=vocab_size,
             model_type=model_type,
             ple_dim=ple_dim,
+            rope_theta=rope_theta,
         )
 
 class ClusterOrchestrator:
