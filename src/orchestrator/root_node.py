@@ -88,23 +88,6 @@ class RootNode:
         )
         self.ffn_model = self.session.load(ffn_graph)
 
-        # Decode graphs (seq_len=1 for single-token autoregressive generation)
-        decode_attn_shard = AttentionShardSpec(
-            ffn_dim_start=0, ffn_dim_end=config.ffn_dim,
-            seq_start=0, seq_end=1,
-        )
-        self.attn_decode_models = {}
-        for hd in needed_hds:
-            dag = build_ulysses_attention_graph(
-                decode_attn_shard, config.hidden_dim, config.n_heads, config.n_kv_heads,
-                hd, self.device, full_q_weights=True,
-            )
-            self.attn_decode_models[hd] = self.session.load(dag)
-
-        self.ffn_decode_model = self.session.load(build_ffn_graph(
-            ffn_shard, config.hidden_dim, self.device, seq_len=1, gated=True,
-        ))
-
         self.worker_conns = []
         self.worker_ids = []
         for i, (host, port) in enumerate(worker_addrs):
@@ -393,7 +376,20 @@ class RootNode:
             np.ascontiguousarray(wk_r),
             np.ascontiguousarray(v_arr),
         )
-        all_qkv = {0: (q_root.to_numpy(), k_root.to_numpy(), v_root.to_numpy())}
+        q_vals = q_root.to_numpy()
+        k_vals = k_root.to_numpy()
+        v_vals = v_root.to_numpy()
+        # Apply QKV biases (Qwen-style)
+        q_bias = rw_attn.get("q_bias")
+        k_bias = rw_attn.get("k_bias")
+        v_bias = rw_attn.get("v_bias")
+        if q_bias is not None:
+            q_vals += q_bias.reshape(1, 1, n_heads, layer_hd)
+        if k_bias is not None:
+            k_vals += k_bias.reshape(1, 1, n_kv, layer_hd)
+        if v_bias is not None and wv_r is not None:
+            v_vals += v_bias.reshape(1, 1, n_kv, layer_hd)
+        all_qkv = {0: (q_vals, k_vals, v_vals)}
 
         # ---- Send normed slices to workers for QKV ----
         for idx, worker_id in enumerate(self.worker_ids):
@@ -537,10 +533,22 @@ class RootNode:
         wk_t = torch.from_numpy(wk_r)
         q_t = torch.mm(xn_t, wq_t)
         k_t = torch.mm(xn_t, wk_t)
+
+        # Add QKV biases (Qwen-style)
+        q_bias = rw_attn.get("q_bias")
+        k_bias = rw_attn.get("k_bias")
+        if q_bias is not None:
+            q_t += torch.from_numpy(q_bias.astype(np.float32))
+        if k_bias is not None:
+            k_t += torch.from_numpy(k_bias.astype(np.float32))
+
         q = q_t.reshape(1, 1, n_heads, layer_hd).numpy()
         k = k_t.reshape(1, 1, n_kv, layer_hd).numpy()
         if wv_r is not None:
             v_t = torch.mm(xn_t, torch.from_numpy(wv_r))
+            v_bias = rw_attn.get("v_bias")
+            if v_bias is not None:
+                v_t += torch.from_numpy(v_bias.astype(np.float32))
             v = v_t.reshape(1, 1, n_kv, layer_hd).numpy()
         else:
             v = k.copy()

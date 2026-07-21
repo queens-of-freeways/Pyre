@@ -40,6 +40,9 @@ class LayerWeightSet:
     ffn_gate: np.ndarray   # [hidden_dim, ffn_dim]
     ffn_up: np.ndarray     # [hidden_dim, ffn_dim]
     ffn_down: np.ndarray   # [ffn_dim, hidden_dim]
+    q_bias: Optional[np.ndarray] = None          # [n_heads * head_dim]
+    k_bias: Optional[np.ndarray] = None          # [n_kv_heads * head_dim]
+    v_bias: Optional[np.ndarray] = None          # [n_kv_heads * head_dim]
     input_layernorm: Optional[np.ndarray] = None      # [hidden_dim]
     post_attention_layernorm: Optional[np.ndarray] = None  # [hidden_dim]
     has_v_proj: bool = True
@@ -125,6 +128,9 @@ def _infer_weight_keys(state: Dict[str, torch.Tensor], model_type: str = "llama"
     else:
         raise ValueError(f"Cannot detect attention key pattern from {first_keys}")
 
+    # Detect QKV bias
+    has_qkv_bias = has("q_proj.bias")
+
     # Detect MLP key pattern (gated vs non-gated)
     ffn_gated = has("mlp.gate_proj") or (has("mlp.gate") and not has("mlp.fc1"))
     if ffn_gated:
@@ -186,6 +192,7 @@ def _infer_weight_keys(state: Dict[str, torch.Tensor], model_type: str = "llama"
         "post_attn_norm_tmpl": post_attn_norm_tmpl,
         "has_ple": has_ple,
         "ple_keys": ple_keys,
+        "has_qkv_bias": has_qkv_bias,
     }
 
 
@@ -217,6 +224,13 @@ def _load_layer_weights(
         up = fc1
         down = fc2
 
+    # QKV biases (used by Qwen, some other models)
+    q_bias = k_bias = v_bias = None
+    if key_info.get("has_qkv_bias"):
+        q_bias = _torch_to_np(state[tmpl.replace(".weight", ".bias").format(layer_idx, "q")], transpose=False)
+        k_bias = _torch_to_np(state[tmpl.replace(".weight", ".bias").format(layer_idx, "k")], transpose=False)
+        v_bias = _torch_to_np(state[tmpl.replace(".weight", ".bias").format(layer_idx, "v")], transpose=False)
+
     # Per-layer norm weights
     input_norm = None
     post_attn_norm = None
@@ -239,6 +253,7 @@ def _load_layer_weights(
 
     return LayerWeightSet(q=q, k=k, v=v, ffn_gate=gate, ffn_up=up, ffn_down=down,
                           has_v_proj=has_v, o=o,
+                          q_bias=q_bias, k_bias=k_bias, v_bias=v_bias,
                           input_layernorm=input_norm, post_attention_layernorm=post_attn_norm,
                           ple_gate=ple_gate, ple_proj=ple_proj, ple_post_norm=ple_post_norm)
 
@@ -246,7 +261,7 @@ def _load_layer_weights(
 def _load_full_weights(model_id: str, num_layers: Optional[int] = None) -> FullWeights:
     from transformers import AutoConfig, AutoModelForCausalLM
     cfg = AutoConfig.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
     state = model.state_dict()
     del model
 
@@ -262,8 +277,13 @@ def _load_full_weights(model_id: str, num_layers: Optional[int] = None) -> FullW
                                      getattr(cfg, "num_layers",
                                              max(key_info["per_layer"].keys()) + 1))
 
-    lm_head = _torch_to_np(state[key_info["lm_head_key"]], transpose=False)
-    embedding = _torch_to_np(state[key_info["embed_key"]], transpose=False)
+    # Share lm_head/embedding when tied (saves 50% memory for large vocabs)
+    if key_info["lm_head_key"] == key_info["embed_key"]:
+        embedding = _torch_to_np(state[key_info["embed_key"]], transpose=False)
+        lm_head = embedding  # same array, no copy
+    else:
+        lm_head = _torch_to_np(state[key_info["lm_head_key"]], transpose=False)
+        embedding = _torch_to_np(state[key_info["embed_key"]], transpose=False)
     final_norm = None
     if key_info["norm_key"]:
         final_norm = state[key_info["norm_key"]].to(torch.float32).cpu().numpy()
@@ -329,6 +349,8 @@ def _load_full_weights(model_id: str, num_layers: Optional[int] = None) -> FullW
         ple_projection_norm = state["model.per_layer_projection_norm.weight"].to(torch.float32).cpu().numpy()
         ple_dim_val = getattr(cfg, "hidden_size_per_layer_input", 0) or 0
         ple_vocab_size_val = getattr(cfg, "vocab_size_per_layer_input", 0) or 0
+
+    del state
 
     return FullWeights(
         layer_weights=layer_weights,
@@ -445,6 +467,9 @@ class WeightProvider:
                 "v": lw.v[:, :self.full.n_kv_heads * hd].copy() if lw.v is not None else None,
                 "o": lw.o[:, :self.full.n_heads * hd].copy() if lw.o is not None else None,
                 "has_v_proj": lw.has_v_proj,
+                "q_bias": lw.q_bias.copy() if lw.q_bias is not None else None,
+                "k_bias": lw.k_bias.copy() if lw.k_bias is not None else None,
+                "v_bias": lw.v_bias.copy() if lw.v_bias is not None else None,
             }
         else:
             ffn_width = p["ffn_end"] - p["ffn_start"]
