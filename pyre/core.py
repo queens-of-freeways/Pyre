@@ -15,6 +15,7 @@ def run_generation(
     max_tokens=10,
     layers=0,
     temperature=0.7,
+    chat=False,
     discover_timeout=3.0,
     expect_workers=None,
     local_worker=True,
@@ -61,7 +62,7 @@ def run_generation(
     gen = _build_gen(worker_addrs, model=model, num_layers=layers)
 
     try:
-        gen.generate(prompt, max_tokens=max_tokens, stream=True, temperature=temperature)
+        gen.generate(prompt, max_tokens=(None if chat else max_tokens), stream=True, temperature=temperature)
         return 0
     finally:
         gen.root.shutdown()

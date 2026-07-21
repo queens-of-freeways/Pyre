@@ -8,6 +8,9 @@ Run large language models across multiple machines, breaking the memory and comp
 # One command — auto-starts a local worker, no separate terminal needed
 pyre run --model HuggingFaceTB/SmolLM-135M --prompt "Hello" --max-tokens 10
 
+# Chat mode — auto-stops at EOS token
+pyre run --model Qwen/Qwen2.5-0.5B-Instruct --prompt "What is 2+2?" --chat
+
 # With remote workers
 pyre run --model mistralai/Mistral-7B-v0.3 --workers 10.0.0.5:9001,10.0.0.6:9002
 
@@ -38,11 +41,13 @@ That's it — pixi pulls Mojo, Python, PyTorch, transformers, zeroconf, and the 
 Starts a local worker by default (the root machine also contributes compute).
 
 | Flag | Default | Description |
-|---|---|---|
+|---|---|---|---|
 | `--model` | `HuggingFaceTB/SmolLM-135M` | Any HuggingFace model ID |
 | `--workers` | auto (mDNS) | Comma-separated `host:port` list |
 | `--prompt` | `Hello, my name is` | Input text |
-| `--max-tokens` | 10 | Tokens to generate |
+| `--max-tokens` | 10 | Tokens to generate (ignored when `--chat`) |
+| `--chat` | false | Generate until EOS token; no `--max-tokens` needed |
+| `--temperature` | 0.7 | Sampling temperature (0 = greedy) |
 | `--layers` | auto (all) | Number of transformer layers |
 | `--no-local` | false | Skip local worker (root only orchestrates) |
 | `--discover-timeout` | 3.0 | Seconds to wait for mDNS discovery |
@@ -51,6 +56,12 @@ Starts a local worker by default (the root machine also contributes compute).
 ```bash
 # Local only
 pyre run --model HuggingFaceTB/SmolLM-135M --prompt "Once upon a time"
+
+# Chat mode (auto-stop at EOS)
+pyre run --model Qwen/Qwen2.5-0.5B-Instruct --prompt "Hello" --chat
+
+# Greedy decoding
+pyre run --model Qwen/Qwen2.5-0.5B-Instruct --prompt "Hi!" --temperature 0
 
 # Explicit remote workers
 pyre run --model Qwen/Qwen2.5-0.5B --workers 192.168.1.5:9001 --prompt "Hello"
@@ -105,6 +116,7 @@ Pyre reads `AutoConfig` from HuggingFace and adapts to any model using standard 
 - Phi-3 / Phi-4
 - Gemma 2/3
 - **Gemma 4** (dual head_dim, K=V sharing, p-RoPE, V_norm, PLE, Shared KV Cache)
+- Any model with QKV bias (Qwen, some fine-tuned models)
 - DeepSeek
 - Any model using `q_proj/k_proj/v_proj/o_proj` + gated FFN
 

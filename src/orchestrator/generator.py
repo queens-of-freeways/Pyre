@@ -56,8 +56,7 @@ class Generator:
         probs = exp_l / np.sum(exp_l, axis=-1, keepdims=True)
         return np.array([[np.random.choice(probs.shape[-1], p=probs[0])]])
 
-    def generate(self, prompt: str, max_tokens: int = 1, stream: bool = False, temperature: float = 0.7) -> str:
-        # Apply chat template for instruct models
+    def generate(self, prompt: str, max_tokens: Optional[int] = None, stream: bool = False, temperature: float = 0.7) -> str:
         if hasattr(self.tokenizer, "apply_chat_template") and not prompt.startswith("<|"):
             try:
                 messages = [{"role": "user", "content": prompt}]
@@ -69,11 +68,9 @@ class Generator:
         else:
             formatted = prompt
 
-        # Tokenize without padding first to get true length
         raw = self.tokenizer(formatted, return_tensors="np", add_special_tokens=False)
         true_len = raw["input_ids"].shape[1]
 
-        # Left-pad to self.seq_len (causal LMs need left-padding so the last token is real)
         pad_id = self.tokenizer.pad_token_id
         if pad_id is None:
             pad_id = self.tokenizer.eos_token_id
@@ -86,10 +83,13 @@ class Generator:
             padded[0, pad_len:] = raw["input_ids"][0, :true_len]
             input_ids = padded.astype(np.int32)
 
+        if max_tokens is None:
+            max_tokens = self.seq_len
+
         output_pieces = []
         kv_cache = {}
 
-        # ---- Prefill: full 64-token forward pass ----
+        # ---- Prefill ----
         x = self._embed(input_ids)
         if self.has_ple:
             hidden_states = self.root.run(x, kv_cache=kv_cache, prefill=True,
@@ -108,13 +108,11 @@ class Generator:
 
         generated = input_ids.copy()
 
-        # ---- Decode steps: single-token KV-cached forward passes ----
         for step in range(max_tokens - 1):
             generated = np.concatenate(
                 [generated, next_token.reshape(1, 1)], axis=1
             )
 
-            # Embed only the new token
             x = self._embed(next_token.reshape(1, 1))
 
             if self.has_ple:
@@ -126,7 +124,6 @@ class Generator:
                     x, kv_cache=kv_cache, prefill=False,
                 )
             logits = self._compute_logits(hidden_states)
-            # For single-token decode, the only position is position 0
             next_token = self._sample(logits[:, 0, :], temperature)
 
             if eos_id is not None and int(next_token[0, 0]) == eos_id:

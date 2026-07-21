@@ -33,24 +33,24 @@ class LayerProperties:
 
 @dataclass
 class LayerWeightSet:
-    q: np.ndarray          # [hidden_dim, n_heads * head_dim]
-    k: np.ndarray          # [hidden_dim, n_kv_heads * head_dim]
-    v: np.ndarray          # [hidden_dim, n_kv_heads * head_dim] or None if K=V
-    o: np.ndarray          # [n_heads * head_dim, hidden_dim] (output proj)
-    ffn_gate: np.ndarray   # [hidden_dim, ffn_dim]
-    ffn_up: np.ndarray     # [hidden_dim, ffn_dim]
-    ffn_down: np.ndarray   # [ffn_dim, hidden_dim]
-    q_bias: Optional[np.ndarray] = None          # [n_heads * head_dim]
-    k_bias: Optional[np.ndarray] = None          # [n_kv_heads * head_dim]
-    v_bias: Optional[np.ndarray] = None          # [n_kv_heads * head_dim]
-    input_layernorm: Optional[np.ndarray] = None      # [hidden_dim]
-    post_attention_layernorm: Optional[np.ndarray] = None  # [hidden_dim]
+    q: torch.Tensor          # [hidden_dim, n_heads * head_dim] bfloat16
+    k: torch.Tensor          # [hidden_dim, n_kv_heads * head_dim] bfloat16
+    ffn_gate: torch.Tensor   # [hidden_dim, ffn_dim] bfloat16
+    ffn_up: torch.Tensor     # [hidden_dim, ffn_dim] bfloat16
+    ffn_down: torch.Tensor   # [ffn_dim, hidden_dim] bfloat16
+    v: Optional[torch.Tensor] = None  # [hidden_dim, n_kv_heads * head_dim] bfloat16
+    o: Optional[torch.Tensor] = None  # [n_heads * head_dim, hidden_dim] bfloat16
+    q_bias: Optional[np.ndarray] = None          # [n_heads * head_dim] float32
+    k_bias: Optional[np.ndarray] = None          # [n_kv_heads * head_dim] float32
+    v_bias: Optional[np.ndarray] = None          # [n_kv_heads * head_dim] float32
+    input_layernorm: Optional[np.ndarray] = None      # [hidden_dim] float32
+    post_attention_layernorm: Optional[np.ndarray] = None  # [hidden_dim] float32
     has_v_proj: bool = True
     props: Optional[LayerProperties] = None
-    # PLE (Per-Layer Embeddings) per-layer weights
-    ple_gate: Optional[np.ndarray] = None      # [hidden_dim, ple_dim]
-    ple_proj: Optional[np.ndarray] = None      # [ple_dim, hidden_dim]
-    ple_post_norm: Optional[np.ndarray] = None # [hidden_dim]
+    # PLE (Per-Layer Embeddings) per-layer weights (stored as float32, tiny)
+    ple_gate: Optional[np.ndarray] = None      # [hidden_dim, ple_dim] float32
+    ple_proj: Optional[np.ndarray] = None      # [ple_dim, hidden_dim] float32
+    ple_post_norm: Optional[np.ndarray] = None # [hidden_dim] float32
 
 
 @dataclass
@@ -77,12 +77,19 @@ class FullWeights:
 
 
 def _torch_to_np(t: torch.Tensor, transpose: bool = False) -> np.ndarray:
-    # numpy doesn't support bfloat16; convert to float32 for numpy storage
+    """Convert torch tensor to float32 numpy array."""
     t = t.to(torch.float32)
     arr = t.cpu().numpy()
     if transpose:
         arr = arr.T
     return np.ascontiguousarray(arr)
+
+def _torch_to_b16(t: torch.Tensor, transpose: bool = False) -> torch.Tensor:
+    """Keep tensor as bfloat16 for memory-efficient storage."""
+    t = t.detach().to(torch.bfloat16)
+    if transpose:
+        t = t.T
+    return t.contiguous()
 
 def _ensure_f32(arr: np.ndarray) -> np.ndarray:
     """Ensure array is float32. No-op if already float32."""
@@ -209,29 +216,29 @@ def _load_layer_weights(
     key_info: dict,
 ) -> LayerWeightSet:
     tmpl = key_info["attn_tmpl"]
-    q = _torch_to_np(state[tmpl.format(layer_idx, "q")], transpose=True)
-    k = _torch_to_np(state[tmpl.format(layer_idx, "k")], transpose=True)
+    q = _torch_to_b16(state[tmpl.format(layer_idx, "q")], transpose=True)
+    k = _torch_to_b16(state[tmpl.format(layer_idx, "k")], transpose=True)
 
     has_v = key_info["per_layer"].get(layer_idx, {}).get("has_v_proj", True)
     v = None
     if has_v:
-        v = _torch_to_np(state[tmpl.format(layer_idx, "v")], transpose=True)
+        v = _torch_to_b16(state[tmpl.format(layer_idx, "v")], transpose=True)
 
-    o = _torch_to_np(state[tmpl.format(layer_idx, "o")], transpose=True)
+    o = _torch_to_b16(state[tmpl.format(layer_idx, "o")], transpose=True)
 
     mlp_tmpl = key_info["mlp_tmpl"]
     if key_info["ffn_gated"]:
-        gate = _torch_to_np(state[mlp_tmpl.format(layer_idx, "gate")], transpose=True)
-        up = _torch_to_np(state[mlp_tmpl.format(layer_idx, "up")], transpose=True)
-        down = _torch_to_np(state[mlp_tmpl.format(layer_idx, "down")], transpose=True)
+        gate = _torch_to_b16(state[mlp_tmpl.format(layer_idx, "gate")], transpose=True)
+        up = _torch_to_b16(state[mlp_tmpl.format(layer_idx, "up")], transpose=True)
+        down = _torch_to_b16(state[mlp_tmpl.format(layer_idx, "down")], transpose=True)
     else:
-        fc1 = _torch_to_np(state[mlp_tmpl.format(layer_idx, "1")], transpose=True)
-        fc2 = _torch_to_np(state[mlp_tmpl.format(layer_idx, "2")], transpose=True)
+        fc1 = _torch_to_b16(state[mlp_tmpl.format(layer_idx, "1")], transpose=True)
+        fc2 = _torch_to_b16(state[mlp_tmpl.format(layer_idx, "2")], transpose=True)
         gate = fc1
         up = fc1
         down = fc2
 
-    # QKV biases (used by Qwen, some other models)
+    # QKV biases (float32 tiny arrays)
     q_bias = k_bias = v_bias = None
     if key_info.get("has_qkv_bias"):
         q_bias = _torch_to_np(state[tmpl.replace(".weight", ".bias").format(layer_idx, "q")], transpose=False)
@@ -248,7 +255,7 @@ def _load_layer_weights(
     if post_attn_norm_tmpl:
         post_attn_norm = state[post_attn_norm_tmpl.format(layer_idx)].to(torch.float32).cpu().numpy()
 
-    # PLE per-layer weights
+    # PLE per-layer weights (float32, tiny)
     ple_gate = None
     ple_proj = None
     ple_post_norm = None
@@ -337,8 +344,12 @@ def _load_full_weights(model_id: str, num_layers: Optional[int] = None) -> FullW
             src_i = kv_shared_map[i]
             if src_i in layer_weights:
                 src_lw = layer_weights[src_i]
-                lw.k = src_lw.k.copy()
-                lw.v = src_lw.v.copy() if src_lw.v is not None else None
+                if isinstance(src_lw.k, torch.Tensor):
+                    lw.k = src_lw.k.clone()
+                    lw.v = src_lw.v.clone() if src_lw.v is not None else None
+                else:
+                    lw.k = src_lw.k.copy()
+                    lw.v = src_lw.v.copy() if src_lw.v is not None else None
             lw.props.kv_source_layer = src_i
 
         layer_weights[i] = lw
@@ -395,6 +406,10 @@ def _slice_attn_for_node(
     o_dim = full.n_heads * hd
 
     def _c(arr, slc):
+        if arr is None:
+            return None
+        if isinstance(arr, torch.Tensor):
+            return np.ascontiguousarray(slc.to(torch.float32).cpu().numpy())
         return slc.copy() if copy_weights else _ensure_f32(slc)
 
     result = {
@@ -407,7 +422,10 @@ def _slice_attn_for_node(
     if lw.v is not None:
         result["v"] = _c(lw.v, lw.v[:, :kv_dim])
     elif lw.has_v_proj:
-        result["v"] = result["k"].copy() if copy_weights else result["k"]
+        if isinstance(lw.k, torch.Tensor):
+            result["v"] = _c(lw.k, lw.k[:, :kv_dim])
+        else:
+            result["v"] = result["k"].copy() if copy_weights else result["k"]
     return result
 
 
@@ -416,6 +434,10 @@ def _slice_ffn_for_node(full: FullWeights, layer_idx: int, ffn_start: int, ffn_e
     lw = full.layer_weights[layer_idx]
 
     def _c(arr, slc):
+        if arr is None:
+            return None
+        if isinstance(arr, torch.Tensor):
+            return np.ascontiguousarray(slc.to(torch.float32).cpu().numpy())
         return slc.copy() if copy_weights else _ensure_f32(slc)
 
     return {
@@ -478,26 +500,31 @@ class WeightProvider:
         props = self._layer_props.get(layer_idx, LayerProperties.standard(self.full.head_dim))
         hd = props.head_dim
 
-        def _slice(arr, key_end, key_start=0):
-            """Slice a weight column range, either as copy (worker) or view+float32 (root)."""
+        def _tslice(arr, slc):
+            """Slice a torch.Tensor or np.ndarray, returning float32 numpy."""
             if arr is None:
                 return None
-            if arr.ndim == 1:
-                slc = arr[key_start:key_end]
+            if isinstance(arr, torch.Tensor):
+                return np.ascontiguousarray(slc.to(torch.float32).cpu().numpy())
+            return slc.copy() if copy_weights else _ensure_f32(slc)
+
+        def _slice(arr, key_end, key_start=0):
+            if arr is None:
+                return None
+            if isinstance(arr, torch.Tensor):
+                slc = arr[:, key_start:key_end] if arr.ndim > 1 else arr[key_start:key_end]
             else:
-                slc = arr[:, key_start:key_end]
-            if copy_weights:
-                return slc.copy()
-            return _ensure_f32(slc)
+                slc = arr[:, key_start:key_end] if arr.ndim > 1 else arr[key_start:key_end]
+            return _tslice(arr, slc)
 
         def _slice_row(arr, key_start, key_end):
-            """Slice a weight row range."""
             if arr is None:
                 return None
-            slc = arr[key_start:key_end, :]
-            if copy_weights:
-                return slc.copy()
-            return _ensure_f32(slc)
+            if isinstance(arr, torch.Tensor):
+                slc = arr[key_start:key_end, :]
+            else:
+                slc = arr[key_start:key_end, :]
+            return _tslice(arr, slc)
 
         if full_q:
             attn = {

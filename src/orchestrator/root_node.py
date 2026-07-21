@@ -388,7 +388,15 @@ class RootNode:
 
         for idx, worker_id in enumerate(self.worker_ids):
             _, qkv = recv_msg(self.worker_conns[idx])
-            all_qkv[worker_id] = qkv
+            q_w, k_w, v_w = qkv
+            # Worker sends raw QKV without bias — root adds bias here
+            if q_bias is not None:
+                q_w = q_w + q_bias.reshape(1, 1, n_heads, layer_hd)
+            if k_bias is not None:
+                k_w = k_w + k_bias.reshape(1, 1, n_kv, layer_hd)
+            if v_bias is not None and wv_r is not None:
+                v_w = v_w + v_bias.reshape(1, 1, n_kv, layer_hd)
+            all_qkv[worker_id] = (q_w, k_w, v_w)
 
         attn_out = self._compute_attention(all_qkv, layer_idx, kv_cache, decode_cache)
 
@@ -533,7 +541,11 @@ class RootNode:
         theta = getattr(self.config, 'rope_theta', 10000.0)
         cache_len = 0
         if layer_idx in decode_cache:
-            cache_len = decode_cache[layer_idx][0].shape[2]
+            entry = decode_cache[layer_idx]
+            if len(entry) == 3:
+                cache_len = entry[2]  # cur_len from pre-allocated buffer
+            else:
+                cache_len = entry[0].shape[2]  # seq dim from legacy format
         if rope_frac > 0:
             q_rope = self._apply_rope(q_rope, rope_fraction=rope_frac,
                                        theta=theta, start_pos=cache_len)

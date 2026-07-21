@@ -31,6 +31,7 @@ class ModelConfig:
     model_type: str = "llama"
     ple_dim: int = 0  # PLE dimension (Gemma 4 E-series only)
     rope_theta: float = 10000.0
+    max_seq_len: int = 2048
 
     @staticmethod
     def from_hf(model_id: str) -> "ModelConfig":
@@ -51,6 +52,7 @@ class ModelConfig:
 
         ple_dim = getattr(cfg, "hidden_size_per_layer_input", 0)
         rope_theta = getattr(cfg, "rope_theta", 10000.0)
+        max_seq_len = getattr(cfg, "max_position_embeddings", 2048)
 
         return ModelConfig(
             hidden_dim=hidden_dim,
@@ -63,6 +65,7 @@ class ModelConfig:
             model_type=model_type,
             ple_dim=ple_dim,
             rope_theta=rope_theta,
+            max_seq_len=max_seq_len,
         )
 
 class ClusterOrchestrator:
