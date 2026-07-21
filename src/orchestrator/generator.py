@@ -49,7 +49,7 @@ class Generator:
     @staticmethod
     def _sample(logits: np.ndarray, temperature: float = 0.7) -> np.ndarray:
         if temperature < 0.01:
-            return np.argmax(logits, axis=-1)
+            return np.argmax(logits, axis=-1, keepdims=True)
         logits = logits.astype(np.float64) / temperature
         max_l = np.max(logits, axis=-1, keepdims=True)
         exp_l = np.exp(logits - max_l)
@@ -187,20 +187,20 @@ def _build_gen(
 
     wp = WeightProvider(model, partitions, num_layers=num_layers)
 
-    all_layer_weights = {}
-    for node_id in range(total_nodes):
-        if node_id == 0:
-            all_layer_weights[node_id] = wp.get_root_weights(node_id)
-        else:
-            all_layer_weights[node_id] = wp.get_node_weights(node_id, total_nodes)
+    # Build only root weights (views, no copies). Workers get weights on-demand via weight_provider.
+    root_weights = {0: wp.get_root_weights(0)}
 
     has_ple = wp.ple_dim > 0
     root = RootNode(
-        worker_addrs, config, all_layer_weights,
+        worker_addrs, config,
+        all_layer_weights=root_weights,
+        weight_provider=wp,
         ple_embedding=wp.get_ple_embedding() if has_ple else None,
         ple_projection=wp.get_ple_projection() if has_ple else None,
         ple_projection_norm=wp.get_ple_projection_norm() if has_ple else None,
     )
+    # weight_provider is kept alive by RootNode; free no-longer-needed large arrays
+    del root_weights
 
     tokenizer = AutoTokenizer.from_pretrained(model)
     if tokenizer.pad_token is None:

@@ -77,11 +77,18 @@ class FullWeights:
 
 
 def _torch_to_np(t: torch.Tensor, transpose: bool = False) -> np.ndarray:
+    # numpy doesn't support bfloat16; convert to float32 for numpy storage
     t = t.to(torch.float32)
     arr = t.cpu().numpy()
     if transpose:
         arr = arr.T
-    return np.ascontiguousarray(arr.astype(np.float32))
+    return np.ascontiguousarray(arr)
+
+def _ensure_f32(arr: np.ndarray) -> np.ndarray:
+    """Ensure array is float32. No-op if already float32."""
+    if arr.dtype != np.float32:
+        return arr.astype(np.float32, copy=False)
+    return arr
 
 
 def _infer_weight_keys(state: Dict[str, torch.Tensor], model_type: str = "llama",
@@ -231,7 +238,7 @@ def _load_layer_weights(
         k_bias = _torch_to_np(state[tmpl.replace(".weight", ".bias").format(layer_idx, "k")], transpose=False)
         v_bias = _torch_to_np(state[tmpl.replace(".weight", ".bias").format(layer_idx, "v")], transpose=False)
 
-    # Per-layer norm weights
+    # Per-layer norm weights (always float32, tiny arrays)
     input_norm = None
     post_attn_norm = None
     input_norm_tmpl = key_info.get("input_norm_tmpl")
@@ -279,11 +286,11 @@ def _load_full_weights(model_id: str, num_layers: Optional[int] = None) -> FullW
 
     # Share lm_head/embedding when tied (saves 50% memory for large vocabs)
     if key_info["lm_head_key"] == key_info["embed_key"]:
-        embedding = _torch_to_np(state[key_info["embed_key"]], transpose=False)
+        embedding = _ensure_f32(_torch_to_np(state[key_info["embed_key"]], transpose=False))
         lm_head = embedding  # same array, no copy
     else:
-        lm_head = _torch_to_np(state[key_info["lm_head_key"]], transpose=False)
-        embedding = _torch_to_np(state[key_info["embed_key"]], transpose=False)
+        lm_head = _ensure_f32(_torch_to_np(state[key_info["lm_head_key"]], transpose=False))
+        embedding = _ensure_f32(_torch_to_np(state[key_info["embed_key"]], transpose=False))
     final_norm = None
     if key_info["norm_key"]:
         final_norm = state[key_info["norm_key"]].to(torch.float32).cpu().numpy()
@@ -379,32 +386,42 @@ def _slice_attn_for_node(
     layer_idx: int,
     head_start: int,
     head_end: int,
+    copy_weights: bool = True,
 ) -> dict:
     lw = full.layer_weights[layer_idx]
     hd = lw.props.head_dim if lw.props else full.head_dim
     q_end = head_end * hd
     kv_dim = full.n_kv_heads * hd
     o_dim = full.n_heads * hd
+
+    def _c(arr, slc):
+        return slc.copy() if copy_weights else _ensure_f32(slc)
+
     result = {
-        "q": lw.q[:, head_start * hd:q_end].copy(),
-        "k": lw.k[:, :kv_dim].copy(),
+        "q": _c(lw.q, lw.q[:, head_start * hd:q_end]),
+        "k": _c(lw.k, lw.k[:, :kv_dim]),
         "v": None,
-        "o": lw.o[:, :o_dim].copy() if lw.o is not None else None,
+        "o": _c(lw.o, lw.o[:, :o_dim]) if lw.o is not None else None,
         "has_v_proj": lw.has_v_proj,
     }
     if lw.v is not None:
-        result["v"] = lw.v[:, :kv_dim].copy()
+        result["v"] = _c(lw.v, lw.v[:, :kv_dim])
     elif lw.has_v_proj:
-        result["v"] = result["k"].copy()
+        result["v"] = result["k"].copy() if copy_weights else result["k"]
     return result
 
 
-def _slice_ffn_for_node(full: FullWeights, layer_idx: int, ffn_start: int, ffn_end: int) -> dict:
+def _slice_ffn_for_node(full: FullWeights, layer_idx: int, ffn_start: int, ffn_end: int,
+                         copy_weights: bool = True) -> dict:
     lw = full.layer_weights[layer_idx]
+
+    def _c(arr, slc):
+        return slc.copy() if copy_weights else _ensure_f32(slc)
+
     return {
-        "gate": lw.ffn_gate[:, ffn_start:ffn_end].copy(),
-        "up": lw.ffn_up[:, ffn_start:ffn_end].copy(),
-        "down": lw.ffn_down[ffn_start:ffn_end, :].copy(),
+        "gate": _c(lw.ffn_gate, lw.ffn_gate[:, ffn_start:ffn_end]),
+        "up": _c(lw.ffn_up, lw.ffn_up[:, ffn_start:ffn_end]),
+        "down": _c(lw.ffn_down, lw.ffn_down[ffn_start:ffn_end, :]),
     }
 
 
@@ -456,26 +473,50 @@ class WeightProvider:
     def num_layers(self) -> int:
         return self.full.num_layers
 
-    def _layer_weights_for_node(self, layer_idx: int, p: dict, full_q: bool) -> dict:
+    def _layer_weights_for_node(self, layer_idx: int, p: dict, full_q: bool, copy_weights: bool = True) -> dict:
         lw = self.full.layer_weights[layer_idx]
         props = self._layer_props.get(layer_idx, LayerProperties.standard(self.full.head_dim))
         hd = props.head_dim
+
+        def _slice(arr, key_end, key_start=0):
+            """Slice a weight column range, either as copy (worker) or view+float32 (root)."""
+            if arr is None:
+                return None
+            if arr.ndim == 1:
+                slc = arr[key_start:key_end]
+            else:
+                slc = arr[:, key_start:key_end]
+            if copy_weights:
+                return slc.copy()
+            return _ensure_f32(slc)
+
+        def _slice_row(arr, key_start, key_end):
+            """Slice a weight row range."""
+            if arr is None:
+                return None
+            slc = arr[key_start:key_end, :]
+            if copy_weights:
+                return slc.copy()
+            return _ensure_f32(slc)
+
         if full_q:
             attn = {
-                "q": lw.q[:, :self.full.n_heads * hd].copy(),
-                "k": lw.k[:, :self.full.n_kv_heads * hd].copy(),
-                "v": lw.v[:, :self.full.n_kv_heads * hd].copy() if lw.v is not None else None,
-                "o": lw.o[:, :self.full.n_heads * hd].copy() if lw.o is not None else None,
+                "q": _slice(lw.q, self.full.n_heads * hd),
+                "k": _slice(lw.k, self.full.n_kv_heads * hd),
+                "v": _slice(lw.v, self.full.n_kv_heads * hd) if lw.v is not None else None,
+                "o": _slice(lw.o, self.full.n_heads * hd) if lw.o is not None else None,
                 "has_v_proj": lw.has_v_proj,
-                "q_bias": lw.q_bias.copy() if lw.q_bias is not None else None,
-                "k_bias": lw.k_bias.copy() if lw.k_bias is not None else None,
-                "v_bias": lw.v_bias.copy() if lw.v_bias is not None else None,
+                "q_bias": _slice(lw.q_bias, self.full.n_heads * hd) if lw.q_bias is not None else None,
+                "k_bias": _slice(lw.k_bias, self.full.n_kv_heads * hd) if lw.k_bias is not None else None,
+                "v_bias": _slice(lw.v_bias, self.full.n_kv_heads * hd) if lw.v_bias is not None else None,
             }
         else:
             ffn_width = p["ffn_end"] - p["ffn_start"]
             n_q_local = ffn_width // hd if ffn_width > 0 else self.full.n_heads
-            attn = _slice_attn_for_node(self.full, layer_idx, 0, n_q_local)
-        ffn = _slice_ffn_for_node(self.full, layer_idx, p["ffn_start"], p["ffn_end"])
+            attn = _slice_attn_for_node(self.full, layer_idx, 0, n_q_local,
+                                        copy_weights=copy_weights)
+        ffn = _slice_ffn_for_node(self.full, layer_idx, p["ffn_start"], p["ffn_end"],
+                                   copy_weights=copy_weights)
         props_dict = {
             "head_dim": hd,
             "has_v_proj": props.has_v_proj,
@@ -489,31 +530,31 @@ class WeightProvider:
             "attn": attn,
             "ffn": ffn,
             "_props": props_dict,
-            "input_layernorm": lw.input_layernorm.copy() if lw.input_layernorm is not None else None,
-            "post_attention_layernorm": lw.post_attention_layernorm.copy() if lw.post_attention_layernorm is not None else None,
+            "input_layernorm": _ensure_f32(lw.input_layernorm) if lw.input_layernorm is not None else None,
+            "post_attention_layernorm": _ensure_f32(lw.post_attention_layernorm) if lw.post_attention_layernorm is not None else None,
         }
         # Include PLE per-layer weights (root only)
         ple_g = lw.ple_gate
         if ple_g is not None:
-            result["ple_gate"] = ple_g
-            result["ple_proj"] = lw.ple_proj
-            result["ple_post_norm"] = lw.ple_post_norm
+            result["ple_gate"] = _ensure_f32(ple_g) if not copy_weights else ple_g.copy()
+            result["ple_proj"] = _ensure_f32(lw.ple_proj) if not copy_weights else lw.ple_proj.copy()
+            result["ple_post_norm"] = _ensure_f32(lw.ple_post_norm) if not copy_weights else lw.ple_post_norm.copy() if lw.ple_post_norm is not None else None
         return result
 
     def get_node_weights(self, node_id: int, num_nodes: int) -> Dict[int, dict]:
-        """Returns {layer_idx: {attn: ..., ffn: ...}} for a worker node (full Q)."""
+        """Returns {layer_idx: {attn: ..., ffn: ...}} for a worker node (full Q, with copies)."""
         p = self.partitions[node_id]
         node_layers = {}
         for layer_idx in range(self.full.num_layers):
-            node_layers[layer_idx] = self._layer_weights_for_node(layer_idx, p, full_q=True)
+            node_layers[layer_idx] = self._layer_weights_for_node(layer_idx, p, full_q=True, copy_weights=True)
         return node_layers
 
     def get_root_weights(self, node_id: int) -> Dict[int, dict]:
-        """Returns {layer_idx: {attn: ..., ffn: ...}} for the root node (full Q)."""
+        """Returns {layer_idx: {attn: ..., ffn: ...}} for the root node. Uses safe copies."""
         p = self.partitions[node_id]
         node_layers = {}
         for layer_idx in range(self.full.num_layers):
-            node_layers[layer_idx] = self._layer_weights_for_node(layer_idx, p, full_q=True)
+            node_layers[layer_idx] = self._layer_weights_for_node(layer_idx, p, full_q=True, copy_weights=True)
         return node_layers
 
     def get_embedding(self) -> np.ndarray:
@@ -564,14 +605,10 @@ def load_real_weights(model_name: str = "HuggingFaceTB/SmolLM-135M", layer_idx: 
     state = model.state_dict()
 
     def _w(name):
-        return np.ascontiguousarray(
-            state[name].to(torch.float32).cpu().numpy().T.astype(np.float32)
-        )
+        return _ensure_f32(_torch_to_np(state[name], transpose=True))
 
     def _norm(name):
-        return np.ascontiguousarray(
-            state[name].to(torch.float32).cpu().numpy().astype(np.float32)
-        )
+        return state[name].to(torch.float32).cpu().numpy()
 
     weights = {
         "q_weight": _w(f"model.layers.{layer_idx}.self_attn.q_proj.weight"),
@@ -582,13 +619,12 @@ def load_real_weights(model_name: str = "HuggingFaceTB/SmolLM-135M", layer_idx: 
         "ffn_down": _w(f"model.layers.{layer_idx}.mlp.down_proj.weight"),
         "input_layernorm": _norm(f"model.layers.{layer_idx}.input_layernorm.weight"),
         "post_attention_layernorm": _norm(f"model.layers.{layer_idx}.post_attention_layernorm.weight"),
-        "lm_head": np.ascontiguousarray(
-            state.get("lm_head.weight", state["model.embed_tokens.weight"])
-            .to(torch.float32).cpu().numpy().astype(np.float32)
-        ),
-        "embedding": np.ascontiguousarray(
-            state["model.embed_tokens.weight"].to(torch.float32).cpu().numpy().astype(np.float32)
-        ),
+        "lm_head": _ensure_f32(_torch_to_np(
+            state.get("lm_head.weight", state["model.embed_tokens.weight"]), transpose=False,
+        )),
+        "embedding": _ensure_f32(_torch_to_np(
+            state["model.embed_tokens.weight"], transpose=False,
+        )),
         "final_norm": _norm("model.norm.weight"),
     }
     return weights
@@ -639,9 +675,9 @@ def create_synthetic_weights(config: dict) -> dict:
 def slice_ffn_weights(full_weights: dict, ffn_start: int, ffn_end: int) -> Dict[str, np.ndarray]:
     width = ffn_end - ffn_start
     return {
-        "ffn_gate": full_weights["ffn_gate"][:, ffn_start:ffn_end].copy(),
-        "ffn_up": full_weights["ffn_up"][:, ffn_start:ffn_end].copy(),
-        "ffn_down": full_weights["ffn_down"][ffn_start:ffn_end, :].copy(),
+        "ffn_gate": _ensure_f32(full_weights["ffn_gate"][:, ffn_start:ffn_end]),
+        "ffn_up": _ensure_f32(full_weights["ffn_up"][:, ffn_start:ffn_end]),
+        "ffn_down": _ensure_f32(full_weights["ffn_down"][ffn_start:ffn_end, :]),
     }
 
 
@@ -650,9 +686,9 @@ def slice_attention_weights(full_weights: dict, head_start: int, head_end: int, 
     q_dim_end = head_end * head_dim
     kv_dim = n_kv_heads * head_dim
     return {
-        "q_slice": full_weights["q_weight"][:, q_dim_start:q_dim_end].copy(),
-        "k_full": full_weights["k_weight"][:, :kv_dim].copy(),
-        "v_full": full_weights["v_weight"][:, :kv_dim].copy(),
+        "q_slice": _ensure_f32(full_weights["q_weight"][:, q_dim_start:q_dim_end]),
+        "k_full": _ensure_f32(full_weights["k_weight"][:, :kv_dim]),
+        "v_full": _ensure_f32(full_weights["v_weight"][:, :kv_dim]),
     }
 
 
@@ -666,14 +702,14 @@ def slice_weights_for_node(node_shard: dict, full_weights: dict, total_nodes: in
     q_dim_end = n_q_local * head_dim
     kv_dim = n_kv_heads * head_dim
     attn = {
-        "q": full_weights["q_weight"][:, q_dim_start:q_dim_end].copy(),
-        "k": full_weights["k_weight"][:, :kv_dim].copy(),
-        "v": full_weights["v_weight"][:, :kv_dim].copy(),
+        "q": _ensure_f32(full_weights["q_weight"][:, q_dim_start:q_dim_end]),
+        "k": _ensure_f32(full_weights["k_weight"][:, :kv_dim]),
+        "v": _ensure_f32(full_weights["v_weight"][:, :kv_dim]),
     }
     ffn = {
-        "gate": full_weights["ffn_gate"][:, node_shard["ffn_start"]:node_shard["ffn_end"]].copy(),
-        "up": full_weights["ffn_up"][:, node_shard["ffn_start"]:node_shard["ffn_end"]].copy(),
-        "down": full_weights["ffn_down"][node_shard["ffn_start"]:node_shard["ffn_end"], :].copy(),
+        "gate": _ensure_f32(full_weights["ffn_gate"][:, node_shard["ffn_start"]:node_shard["ffn_end"]]),
+        "up": _ensure_f32(full_weights["ffn_up"][:, node_shard["ffn_start"]:node_shard["ffn_end"]]),
+        "down": _ensure_f32(full_weights["ffn_down"][node_shard["ffn_start"]:node_shard["ffn_end"], :]),
     }
     return {"attn": attn, "ffn": ffn}
 

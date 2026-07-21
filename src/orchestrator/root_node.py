@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import math
-import pickle
 import socket
-import struct
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -17,21 +15,13 @@ from max.driver import CPU
 from src.attention.builder import build_ulysses_attention_graph, ShardSpec as AttentionShardSpec
 from src.ffn.builder import build_ffn_graph, ShardSpec as FFNShardSpec
 from src.orchestrator.cluster import ModelConfig
+from src.orchestrator.net import send_msg, recv_msg, recv_exact
 from src.orchestrator.protocol import (
     MSG_SHARD_SPEC, MSG_READY, MSG_FORWARD_DATA, MSG_FORWARD_RESULT,
     MSG_SHUTDOWN, MSG_ATTN_OUTPUT, MSG_FFN_RESULT, MSG_INIT_WEIGHTS,
     MSG_DECODE_STEP,
 )
-
-
-def _recv_exact(conn, n):
-    data = b""
-    while len(data) < n:
-        chunk = conn.recv(n - len(data))
-        if not chunk:
-            raise ConnectionError("Connection closed")
-        data += chunk
-    return data
+from src.orchestrator.quantizer import quantize_weights_dict
 
 
 class RootNode:
@@ -40,6 +30,7 @@ class RootNode:
         worker_addrs: List[Tuple[str, int]],
         config: ModelConfig,
         all_layer_weights: Dict[int, Dict[int, dict]] = None,
+        weight_provider: Optional["WeightProvider"] = None,
         ple_embedding: Optional[np.ndarray] = None,
         ple_projection: Optional[np.ndarray] = None,
         ple_projection_norm: Optional[np.ndarray] = None,
@@ -52,6 +43,7 @@ class RootNode:
         self.ple_projection = ple_projection
         self.ple_projection_norm = ple_projection_norm
         self.ple_dim = config.ple_dim if hasattr(config, 'ple_dim') else 0
+        self._wp = weight_provider
 
         total_nodes = 1 + len(worker_addrs)
         self.partitions = self._solve_partitions(total_nodes)
@@ -78,7 +70,7 @@ class RootNode:
             )
             self.attn_models[hd] = self.session.load(attn_graph)
 
-        full_seq_len = 64  # FFN runs on all positions, each node with its weight shard
+        full_seq_len = 64
         ffn_shard = FFNShardSpec(
             ffn_dim_start=p0["ffn_start"], ffn_dim_end=p0["ffn_end"],
         )
@@ -98,13 +90,23 @@ class RootNode:
                 ffn_dim_start=p["ffn_start"], ffn_dim_end=p["ffn_end"],
                 seq_start=p["seq_start"], seq_end=p["seq_end"],
             )
-            self._send_msg(conn, MSG_SHARD_SPEC, (shard_spec, config))
-            msg_type, _ = self._recv_msg(conn)
+            send_msg(conn, MSG_SHARD_SPEC, (shard_spec, config))
+            msg_type, _ = recv_msg(conn)
             if msg_type != MSG_READY:
                 raise RuntimeError(f"Expected READY from worker {worker_id}, got {msg_type}")
 
+            # Build worker weights on-demand, quantize, send, then free memory
             worker_data = {"weights": {}, "props": {}, "graph_key": {}}
-            if all_layer_weights and worker_id in all_layer_weights:
+            if weight_provider is not None:
+                wl = weight_provider.get_node_weights(worker_id, total_nodes)
+                worker_data["weights"] = {k: v for k, v in wl.items()}
+                for lidx, lw in wl.items():
+                    lp = lw.get("_props", {})
+                    worker_data["props"][lidx] = lp
+                    hd = lp.get("head_dim", config.head_dim)
+                    worker_data["graph_key"][lidx] = (hd, 0, 0, 0, 0)
+                del wl
+            elif all_layer_weights and worker_id in all_layer_weights:
                 wl = all_layer_weights[worker_id]
                 worker_data["weights"] = {k: v for k, v in wl.items()}
                 for lidx, lw in wl.items():
@@ -112,7 +114,13 @@ class RootNode:
                     worker_data["props"][lidx] = lp
                     hd = lp.get("head_dim", config.head_dim)
                     worker_data["graph_key"][lidx] = (hd, 0, 0, 0, 0)
-            self._send_msg(conn, MSG_INIT_WEIGHTS, worker_data)
+                # Free worker weight copies from memory after sending
+                del all_layer_weights[worker_id]
+            # Quantize before sending (4x compression for pickle)
+            worker_data_q = quantize_weights_dict(worker_data)
+            del worker_data
+            send_msg(conn, MSG_INIT_WEIGHTS, worker_data_q)
+            del worker_data_q
 
             self.worker_conns.append(conn)
             self.worker_ids.append(worker_id)
@@ -191,11 +199,9 @@ class RootNode:
         n_heads = self.config.n_heads
         n_kv = self.config.n_kv_heads
 
-        # Check if this layer shares KV from another (KV shared cache)
         props = self.all_layer_weights.get(0, {}).get(layer_idx, {}).get("_props", {})
         kv_source = props.get("kv_source_layer", None)
         if kv_source is not None and kv_cache is not None and kv_source in kv_cache:
-            # Reuse cached K,V from source layer
             k_cached, v_cached = kv_cache[kv_source]
             ids = [0] + self.worker_ids
             q_full = np.concatenate([all_qkv[i][0] for i in ids], axis=1)
@@ -235,7 +241,6 @@ class RootNode:
         scale = np.float32(np.sqrt(head_dim))
         scores = q @ k_exp.transpose(0, 1, 3, 2) / scale
 
-        # Causal mask: each position can only attend to itself and earlier positions
         mask = np.triu(np.full((full_seq, full_seq), -np.inf, dtype=np.float32), k=1)
         scores = scores + mask
 
@@ -244,30 +249,22 @@ class RootNode:
         attn = probs @ v_exp
         attn = attn.transpose(0, 2, 1, 3).reshape(1, full_seq, n_heads * head_dim)
 
-        # Cache pre-RoPE K,V for KV sharing across layers (Gemma 4)
         if kv_source is None and kv_cache is not None:
             kv_cache[layer_idx] = (k_full, v_full)
-        # Cache post-RoPE K,V for decode-step autoregressive generation
         if kv_source is None and decode_cache is not None:
             decode_cache[layer_idx] = (k, v)
 
         return attn.astype(np.float32)
 
     def _compute_ple_signal(self, input_ids: np.ndarray, x: np.ndarray) -> Optional[np.ndarray]:
-        """Compute per-layer PLE signal: [batch, seq, num_layers, ple_dim]."""
         if self.ple_embedding is None:
             return None
-        # Token-identity component
         input_ids_clipped = np.clip(input_ids, 0, self.ple_embedding.shape[0] - 1)
-        ple_token = self.ple_embedding[input_ids_clipped]  # [batch, seq, num_layers * ple_dim]
-        # Context-aware component
-        ple_context = x @ self.ple_projection  # [batch, seq, num_layers * ple_dim]
+        ple_token = self.ple_embedding[input_ids_clipped]
+        ple_context = x @ self.ple_projection
         ple_context *= (self.config.hidden_dim ** -0.5)
-        # Combine
         ple_all = (ple_context + ple_token) * (2.0 ** -0.5)
-        # Reshape to separate layers
         ple_all = ple_all.reshape(*x.shape[:2], self.config.num_layers, self.ple_dim)
-        # Apply RMSNorm along ple_dim
         if self.ple_projection_norm is not None:
             mean_sq = np.mean(ple_all.astype(np.float64) ** 2, axis=-1, keepdims=True)
             ple_all = (ple_all / np.sqrt(mean_sq + 1e-6) * self.ple_projection_norm).astype(np.float32)
@@ -277,17 +274,14 @@ class RootNode:
     def _apply_ple_to_hidden(hidden: np.ndarray, ple_signal: np.ndarray,
                               ple_gate: np.ndarray, ple_proj: np.ndarray,
                               ple_post_norm: np.ndarray) -> np.ndarray:
-        """Apply Per-Layer Embeddings to hidden states (Gemma 4 decoder layer style)."""
-        # Define gelu activation (clamp input to prevent overflow in x**3)
         def gelu(x):
             x_clamped = np.clip(x, -100, 100)
             return 0.5 * x_clamped * (1.0 + np.tanh(math.sqrt(2.0 / math.pi) * (x_clamped + 0.044715 * x_clamped ** 3)))
         residual = hidden.copy()
-        gated = hidden @ ple_gate  # [batch, seq, hidden] -> [batch, seq, ple_dim]
+        gated = hidden @ ple_gate
         gated = gelu(gated)
         gated = gated * ple_signal
-        hidden_add = gated @ ple_proj  # [batch, seq, ple_dim] -> [batch, seq, hidden]
-        # RMSNorm
+        hidden_add = gated @ ple_proj
         mean_sq = np.mean(hidden_add.astype(np.float64) ** 2, axis=-1, keepdims=True)
         hidden_add = (hidden_add / np.sqrt(mean_sq + 1e-6) * ple_post_norm).astype(np.float32)
         return residual + hidden_add
@@ -303,11 +297,8 @@ class RootNode:
             num_layers = 1
 
         if not prefill:
-            # Decode mode: x is [1, 1, hidden_dim] (single new token)
             return self._decode_step(x, kv_cache, input_ids)
 
-        # Prefill mode: x is [1, seq_len, hidden_dim]
-        # Pre-compute PLE signal once
         ple_all = self._compute_ple_signal(input_ids, x) if (
             self.ple_embedding is not None and input_ids is not None
         ) else None
@@ -319,7 +310,6 @@ class RootNode:
             h = self._run_single_layer(x, layer_idx, ple_slice, kv_cache_internal, decode_cache)
             x = h
 
-        # Populate caller's kv_cache with decode-ready cache
         if kv_cache is not None:
             kv_cache.clear()
             kv_cache.update(decode_cache)
@@ -340,7 +330,6 @@ class RootNode:
             root_w = self.all_layer_weights[0].get(layer_idx, {})
         rw_attn = root_w.get("attn", {})
 
-        # ---- Pre-attention RMSNorm ----
         input_ln = root_w.get("input_layernorm")
         if input_ln is not None:
             x_norm = self._rms_norm(x, input_ln)
@@ -348,7 +337,6 @@ class RootNode:
             variance = np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True)
             x_norm = (x / np.sqrt(variance + 1e-6)).astype(np.float32)
 
-        # ---- QKV projection on normed input ----
         p0 = self.partitions[0]
         x_root = x_norm[:, p0["seq_start"]:p0["seq_end"], :]
 
@@ -379,7 +367,6 @@ class RootNode:
         q_vals = q_root.to_numpy()
         k_vals = k_root.to_numpy()
         v_vals = v_root.to_numpy()
-        # Apply QKV biases (Qwen-style)
         q_bias = rw_attn.get("q_bias")
         k_bias = rw_attn.get("k_bias")
         v_bias = rw_attn.get("v_bias")
@@ -391,31 +378,26 @@ class RootNode:
             v_vals += v_bias.reshape(1, 1, n_kv, layer_hd)
         all_qkv = {0: (q_vals, k_vals, v_vals)}
 
-        # ---- Send normed slices to workers for QKV ----
         for idx, worker_id in enumerate(self.worker_ids):
             p = self.partitions[worker_id]
             x_worker = x_norm[:, p["seq_start"]:p["seq_end"], :]
-            self._send_msg(
+            send_msg(
                 self.worker_conns[idx], MSG_FORWARD_DATA,
                 (layer_idx, x_worker),
             )
 
         for idx, worker_id in enumerate(self.worker_ids):
-            _, qkv = self._recv_msg(self.worker_conns[idx])
+            _, qkv = recv_msg(self.worker_conns[idx])
             all_qkv[worker_id] = qkv
 
-        # ---- Attention (with RoPE applied inside) ----
         attn_out = self._compute_attention(all_qkv, layer_idx, kv_cache, decode_cache)
 
-        # Output projection
         o_weight = root_w.get("attn", {}).get("o")
         if o_weight is not None:
             attn_out = attn_out @ o_weight
 
-        # ---- Residual: h = x + attn_out ----
         h = x + attn_out
 
-        # ---- Pre-FFN RMSNorm ----
         post_attn_ln = root_w.get("post_attention_layernorm")
         if post_attn_ln is not None:
             h_norm = self._rms_norm(h, post_attn_ln)
@@ -423,7 +405,6 @@ class RootNode:
             variance = np.mean(h.astype(np.float64) ** 2, axis=-1, keepdims=True)
             h_norm = (h / np.sqrt(variance + 1e-6)).astype(np.float32)
 
-        # ---- FFN: each node computes ALL positions with its weight shard, then sum ----
         rw_ffn = root_w.get("ffn", {})
         p0 = self.partitions[0]
         width0 = p0["ffn_end"] - p0["ffn_start"]
@@ -446,18 +427,15 @@ class RootNode:
             np.ascontiguousarray(ffn_up_r),
             np.ascontiguousarray(ffn_down_r),
         )
-        ffn_out = partial_root.to_numpy()  # root's shard contribution for ALL positions
+        ffn_out = partial_root.to_numpy()
 
         for idx, worker_id in enumerate(self.worker_ids):
-            # Send the FULL h_norm (all positions) to each worker for its FFN shard
-            self._send_msg(self.worker_conns[idx], MSG_ATTN_OUTPUT, (h_norm,))
-            _, partial = self._recv_msg(self.worker_conns[idx])
-            ffn_out += partial  # sum shards per position
+            send_msg(self.worker_conns[idx], MSG_ATTN_OUTPUT, (h_norm,))
+            _, partial = recv_msg(self.worker_conns[idx])
+            ffn_out += partial
 
-        # ---- Residual: output = h + ffn_out ----
         final_output = h + ffn_out
 
-        # ---- Apply PLE after FFN + residual (Gemma 4 pattern) ----
         if ple_slice is not None:
             ple_gate = root_w.get("ple_gate")
             if ple_gate is not None:
@@ -472,17 +450,14 @@ class RootNode:
 
     def _decode_step(self, x: np.ndarray, decode_cache: dict,
                       input_ids: Optional[np.ndarray] = None) -> np.ndarray:
-        """Single-token decode step using KV cache. x is [1, 1, hidden_dim]."""
         if self.all_layer_weights and 0 in self.all_layer_weights:
             num_layers = len(self.all_layer_weights[0])
         else:
             num_layers = 1
 
-        # PLE for decode: compute signal just for the new position
         ple_all = None
         if self.ple_embedding is not None and input_ids is not None:
             ple_all = self._compute_ple_signal(input_ids, x)
-            # ple_all: [1, total_seq, num_layers, ple_dim], extract last position
             ple_all = ple_all[:, -1:, :, :]
 
         for layer_idx in range(num_layers):
@@ -494,8 +469,7 @@ class RootNode:
     def _decode_single_layer(self, x: np.ndarray, layer_idx: int,
                               decode_cache: dict,
                               ple_slice: Optional[np.ndarray] = None) -> np.ndarray:
-        """Decode one transformer layer for a single new token with KV cache."""
-        batch, seq_len, hidden_dim = x.shape  # seq_len == 1
+        batch, seq_len, hidden_dim = x.shape
         head_dim = self.config.head_dim
         n_heads = self.config.n_heads
         n_kv = self.config.n_kv_heads
@@ -505,7 +479,6 @@ class RootNode:
             root_w = self.all_layer_weights[0].get(layer_idx, {})
         rw_attn = root_w.get("attn", {})
 
-        # ---- Pre-attention RMSNorm ----
         input_ln = root_w.get("input_layernorm")
         if input_ln is not None:
             x_norm = self._rms_norm(x, input_ln)
@@ -513,7 +486,6 @@ class RootNode:
             variance = np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True)
             x_norm = (x / np.sqrt(variance + 1e-6)).astype(np.float32)
 
-        # ---- QKV projection for the single token (torch for fast small matmuls) ----
         layer_hd = root_w.get("_props", {}).get("head_dim", head_dim)
         wq_r = rw_attn.get("q")
         if wq_r is None:
@@ -528,13 +500,12 @@ class RootNode:
             wv_r = np.random.randn(hidden_dim, n_kv * layer_hd).astype(np.float32)
             rw_attn["v"] = wv_r
 
-        xn_t = torch.from_numpy(x_norm)[0]  # [1, 576]
+        xn_t = torch.from_numpy(x_norm)[0]
         wq_t = torch.from_numpy(wq_r)
         wk_t = torch.from_numpy(wk_r)
         q_t = torch.mm(xn_t, wq_t)
         k_t = torch.mm(xn_t, wk_t)
 
-        # Add QKV biases (Qwen-style)
         q_bias = rw_attn.get("q_bias")
         k_bias = rw_attn.get("k_bias")
         if q_bias is not None:
@@ -553,24 +524,27 @@ class RootNode:
         else:
             v = k.copy()
 
-        q_rope = q.transpose(0, 2, 1, 3)   # [1, n_heads, 1, head_dim]
-        k_rope = k.transpose(0, 2, 1, 3)   # [1, n_kv, 1, head_dim]
-        v_out = v.transpose(0, 2, 1, 3)    # [1, n_kv, 1, head_dim]
+        q_rope = q.transpose(0, 2, 1, 3)
+        k_rope = k.transpose(0, 2, 1, 3)
+        v_out = v.transpose(0, 2, 1, 3)
 
-        # ---- Apply RoPE to new Q,K for the current sequence position ----
         props = root_w.get("_props", {})
         rope_frac = props.get("rope_fraction", 1.0)
         theta = getattr(self.config, 'rope_theta', 10000.0)
         cache_len = 0
         if layer_idx in decode_cache:
-            cache_len = decode_cache[layer_idx][0].shape[2]  # seq dim after transpose
+            cache_len = decode_cache[layer_idx][0].shape[2]
         if rope_frac > 0:
             q_rope = self._apply_rope(q_rope, rope_fraction=rope_frac,
                                        theta=theta, start_pos=cache_len)
             k_rope = self._apply_rope(k_rope, rope_fraction=rope_frac,
                                        theta=theta, start_pos=cache_len)
 
-        # ---- Append to KV cache ----
+        # ---- Append to KV cache (concatenation) ----
+        if layer_idx in decode_cache:
+            if len(decode_cache[layer_idx]) == 3:
+                # Pre-allocated buffer format — ignore, re-init via old path
+                del decode_cache[layer_idx]
         if layer_idx in decode_cache:
             cached_k, cached_v = decode_cache[layer_idx]
             k_full = np.concatenate([cached_k, k_rope], axis=2)
@@ -580,25 +554,20 @@ class RootNode:
             v_full = v_out
         decode_cache[layer_idx] = (k_full, v_full)
 
-        # ---- Clipping ----
         q_rope = np.clip(q_rope, -1000, 1000)
         k_full = np.clip(k_full, -1000, 1000)
         v_full = np.clip(v_full, -1000, 1000)
 
-        # ---- Attention with cached K,V ----
         attn_out = self._compute_attention_decode(q_rope, k_full, v_full, layer_idx)
 
-        # ---- Output projection (torch) ----
         o_weight = root_w.get("attn", {}).get("o")
         if o_weight is not None:
             ao_t = torch.mm(torch.from_numpy(attn_out.reshape(-1, attn_out.shape[-1])),
                             torch.from_numpy(o_weight))
             attn_out = ao_t.reshape(attn_out.shape).numpy()
 
-        # ---- Residual: h = x + attn_out ----
         h = x + attn_out
 
-        # ---- Pre-FFN RMSNorm ----
         post_attn_ln = root_w.get("post_attention_layernorm")
         if post_attn_ln is not None:
             h_norm = self._rms_norm(h, post_attn_ln)
@@ -606,7 +575,6 @@ class RootNode:
             variance = np.mean(h.astype(np.float64) ** 2, axis=-1, keepdims=True)
             h_norm = (h / np.sqrt(variance + 1e-6)).astype(np.float32)
 
-        # ---- FFN (tensor-parallel: root shard + worker shard, torch for speed) ----
         rw_ffn = root_w.get("ffn", {})
         p0 = self.partitions[0]
         width0 = p0["ffn_end"] - p0["ffn_start"]
@@ -623,7 +591,7 @@ class RootNode:
             ffn_down_r = np.random.randn(width0, hidden_dim).astype(np.float32)
             rw_ffn["down"] = ffn_down_r
 
-        hn_t = torch.from_numpy(h_norm)[0]  # [1, 576]
+        hn_t = torch.from_numpy(h_norm)[0]
         gate_t = torch.mm(hn_t, torch.from_numpy(ffn_gate_r))
         up_t = torch.mm(hn_t, torch.from_numpy(ffn_up_r))
         gate_sig = torch.sigmoid(gate_t)
@@ -632,15 +600,13 @@ class RootNode:
         ffn_out = ffn_t.numpy().reshape(h_norm.shape)
 
         for idx, worker_id in enumerate(self.worker_ids):
-            self._send_msg(self.worker_conns[idx], MSG_DECODE_STEP,
+            send_msg(self.worker_conns[idx], MSG_DECODE_STEP,
                            (layer_idx, h_norm))
-            _, partial = self._recv_msg(self.worker_conns[idx])
+            _, partial = recv_msg(self.worker_conns[idx])
             ffn_out += partial
 
-        # ---- Residual: output = h + ffn_out ----
         final_output = h + ffn_out
 
-        # ---- Apply PLE ----
         if ple_slice is not None:
             ple_gate = root_w.get("ple_gate")
             if ple_gate is not None:
@@ -653,12 +619,6 @@ class RootNode:
 
     @staticmethod
     def _compute_attention_decode(q, k, v, layer_idx=0):
-        """Compute attention for a single Q token against cached K,V.
-
-        q: [1, n_heads, 1, head_dim] (RoPE'd for current position)
-        k: [1, n_kv, cache_len, head_dim] (all positions RoPE'd)
-        v: [1, n_kv, cache_len, head_dim]
-        """
         n_heads = q.shape[1]
         n_kv = k.shape[1]
         head_dim = q.shape[3]
@@ -681,18 +641,7 @@ class RootNode:
     def shutdown(self):
         for conn in self.worker_conns:
             try:
-                self._send_msg(conn, MSG_SHUTDOWN)
+                send_msg(conn, MSG_SHUTDOWN)
                 conn.close()
             except Exception:
                 pass
-
-    def _send_msg(self, conn, msg_type, obj=None):
-        payload = pickle.dumps(obj) if obj is not None else b""
-        header = struct.pack("!II", msg_type, len(payload))
-        conn.sendall(header + payload)
-
-    def _recv_msg(self, conn):
-        header = _recv_exact(conn, 8)
-        msg_type, payload_len = struct.unpack("!II", header)
-        payload = _recv_exact(conn, payload_len)
-        return msg_type, pickle.loads(payload) if payload else None

@@ -6,12 +6,8 @@ from typing import Tuple
 import numpy as np
 
 
-def quantize_q80(arr: np.ndarray, block_size: int = 32) -> Tuple[np.ndarray, np.ndarray]:
-    """Quantize float32 array to Q8_0 (block int8 + fp32 scale).
-    
-    Returns (qdata, scales) where qdata is int8 and scales is float32.
-    Compression: 4x for float32 input.
-    """
+def quantize_q80(arr: np.ndarray, block_size: int = 32) -> Tuple[np.ndarray, np.ndarray, Tuple[int, ...]]:
+    """Quantize float32 array to Q8_0 (block int8 + fp32 scale)."""
     orig_shape = arr.shape
     flat = arr.ravel().astype(np.float32)
     n = flat.shape[0]
@@ -22,10 +18,9 @@ def quantize_q80(arr: np.ndarray, block_size: int = 32) -> Tuple[np.ndarray, np.
     blocks = padded.reshape(n_blocks, block_size)
     absmax = np.max(np.abs(blocks), axis=1, keepdims=True)
     absmax = np.where(absmax == 0, 1.0, absmax)
-    scales = absmax / 127.0
-    qdata = np.clip(np.round(blocks / scales), -128, 127).astype(np.int8)
+    scales = (absmax / 127.0).ravel()
+    qdata = np.clip(np.round(blocks / (scales.reshape(n_blocks, 1))), -128, 127).astype(np.int8)
 
-    scales = scales.ravel()
     return qdata, scales, orig_shape
 
 
@@ -40,11 +35,11 @@ def dequantize_q80(qdata: np.ndarray, scales: np.ndarray,
     total = 1
     for d in orig_shape:
         total *= d
-    return result[:total].reshape(orig_shape)
+    return np.ascontiguousarray(result[:total].reshape(orig_shape))
 
 
 def quantize_weights_dict(weights: dict) -> dict:
-    """Recursively quantize all numpy arrays in a weight dict."""
+    """Recursively quantize all numpy arrays in a weight dict. Flags unsafe=False for pickle."""
     qd = {}
     for k, v in weights.items():
         if isinstance(v, dict):
