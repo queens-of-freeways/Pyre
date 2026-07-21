@@ -25,8 +25,10 @@ def main():
               help="Return as soon as N workers found via mDNS")
 @click.option("--no-local", is_flag=True, default=False,
               help="Do NOT start a local worker")
+@click.option("--temperature", default=0.7, type=float,
+              help="Sampling temperature (0 = greedy, 0.7 = default)")
 def run(model, workers, prompt, max_tokens, layers,
-        discover_timeout, expect_workers, no_local):
+        discover_timeout, expect_workers, no_local, temperature):
     """Run distributed generation (auto-starts a local worker)."""
     exit(run_generation(
         model=model,
@@ -34,6 +36,7 @@ def run(model, workers, prompt, max_tokens, layers,
         prompt=prompt,
         max_tokens=max_tokens,
         layers=layers,
+        temperature=temperature,
         discover_timeout=discover_timeout,
         expect_workers=expect_workers,
         no_local=no_local,

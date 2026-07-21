@@ -641,11 +641,15 @@ def slice_weights_for_node(node_shard: dict, full_weights: dict, total_nodes: in
     q_dim_end = n_q_local * head_dim
     kv_dim = n_kv_heads * head_dim
     attn = {
-        "q_slice": full_weights["q_weight"][:, q_dim_start:q_dim_end].copy(),
-        "k_full": full_weights["k_weight"][:, :kv_dim].copy(),
-        "v_full": full_weights["v_weight"][:, :kv_dim].copy(),
+        "q": full_weights["q_weight"][:, q_dim_start:q_dim_end].copy(),
+        "k": full_weights["k_weight"][:, :kv_dim].copy(),
+        "v": full_weights["v_weight"][:, :kv_dim].copy(),
     }
-    ffn = slice_ffn_weights(full_weights, node_shard["ffn_start"], node_shard["ffn_end"])
+    ffn = {
+        "gate": full_weights["ffn_gate"][:, node_shard["ffn_start"]:node_shard["ffn_end"]].copy(),
+        "up": full_weights["ffn_up"][:, node_shard["ffn_start"]:node_shard["ffn_end"]].copy(),
+        "down": full_weights["ffn_down"][node_shard["ffn_start"]:node_shard["ffn_end"], :].copy(),
+    }
     return {"attn": attn, "ffn": ffn}
 
 
@@ -662,25 +666,25 @@ def validate_weight_shapes(node_weights: Dict[int, dict], partitions: Dict[int, 
 
         weights = node_weights[node_id]
         w = weights["ffn"]
-        assert w["ffn_gate"].shape == (hidden_dim, width), (
-            f"Node {node_id} ffn_gate shape {w['ffn_gate'].shape} != ({hidden_dim}, {width})"
+        assert w["gate"].shape == (hidden_dim, width), (
+            f"Node {node_id} ffn_gate shape {w['gate'].shape} != ({hidden_dim}, {width})"
         )
-        assert w["ffn_up"].shape == (hidden_dim, width), (
-            f"Node {node_id} ffn_up shape {w['ffn_up'].shape} != ({hidden_dim}, {width})"
+        assert w["up"].shape == (hidden_dim, width), (
+            f"Node {node_id} ffn_up shape {w['up'].shape} != ({hidden_dim}, {width})"
         )
-        assert w["ffn_down"].shape == (width, hidden_dim), (
-            f"Node {node_id} ffn_down shape {w['ffn_down'].shape} != ({width}, {hidden_dim})"
+        assert w["down"].shape == (width, hidden_dim), (
+            f"Node {node_id} ffn_down shape {w['down'].shape} != ({width}, {hidden_dim})"
         )
 
         a = weights["attn"]
-        assert a["q_slice"].shape == (hidden_dim, n_q_local * head_dim), (
-            f"Node {node_id} q_slice shape {a['q_slice'].shape} != ({hidden_dim}, {n_q_local * head_dim})"
+        assert a["q"].shape == (hidden_dim, n_q_local * head_dim), (
+            f"Node {node_id} q_slice shape {a['q'].shape} != ({hidden_dim}, {n_q_local * head_dim})"
         )
-        assert a["k_full"].shape == (hidden_dim, n_kv_local * head_dim), (
-            f"Node {node_id} k_full shape {a['k_full'].shape} != ({hidden_dim}, {n_kv_local * head_dim})"
+        assert a["k"].shape == (hidden_dim, n_kv_local * head_dim), (
+            f"Node {node_id} k_full shape {a['k'].shape} != ({hidden_dim}, {n_kv_local * head_dim})"
         )
-        assert a["v_full"].shape == (hidden_dim, n_kv_local * head_dim), (
-            f"Node {node_id} v_full shape {a['v_full'].shape} != ({hidden_dim}, {n_kv_local * head_dim})"
+        assert a["v"].shape == (hidden_dim, n_kv_local * head_dim), (
+            f"Node {node_id} v_full shape {a['v'].shape} != ({hidden_dim}, {n_kv_local * head_dim})"
         )
 
     return True

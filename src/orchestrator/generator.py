@@ -46,40 +46,96 @@ class Generator:
             hidden_states = self._rms_norm(hidden_states)
         return hidden_states @ self.lm_head.T
 
-    def generate(self, prompt: str, max_tokens: int = 1, stream: bool = False) -> str:
-        tokens = self.tokenizer(
-            prompt, return_tensors="np",
-            padding="max_length", max_length=self.seq_len,
-            truncation=True,
-        )
-        input_ids = tokens["input_ids"].astype(np.int32)
+    @staticmethod
+    def _sample(logits: np.ndarray, temperature: float = 0.7) -> np.ndarray:
+        if temperature < 0.01:
+            return np.argmax(logits, axis=-1)
+        logits = logits.astype(np.float64) / temperature
+        max_l = np.max(logits, axis=-1, keepdims=True)
+        exp_l = np.exp(logits - max_l)
+        probs = exp_l / np.sum(exp_l, axis=-1, keepdims=True)
+        return np.array([[np.random.choice(probs.shape[-1], p=probs[0])]])
 
+    def generate(self, prompt: str, max_tokens: int = 1, stream: bool = False, temperature: float = 0.7) -> str:
+        # Apply chat template for instruct models
+        if hasattr(self.tokenizer, "apply_chat_template") and not prompt.startswith("<|"):
+            try:
+                messages = [{"role": "user", "content": prompt}]
+                formatted = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            except Exception:
+                formatted = prompt
+        else:
+            formatted = prompt
+
+        # Tokenize without padding first to get true length
+        raw = self.tokenizer(formatted, return_tensors="np", add_special_tokens=False)
+        true_len = raw["input_ids"].shape[1]
+
+        # Left-pad to self.seq_len (causal LMs need left-padding so the last token is real)
         pad_id = self.tokenizer.pad_token_id
         if pad_id is None:
             pad_id = self.tokenizer.eos_token_id
 
-        generated = input_ids.copy()
+        if true_len >= self.seq_len:
+            input_ids = raw["input_ids"][:, -self.seq_len:].astype(np.int32)
+        else:
+            pad_len = self.seq_len - true_len
+            padded = np.full((1, self.seq_len), pad_id, dtype=np.int32)
+            padded[0, pad_len:] = raw["input_ids"][0, :true_len]
+            input_ids = padded.astype(np.int32)
+
         output_pieces = []
+        kv_cache = {}
 
-        for step in range(max_tokens):
-            x = self._embed(generated)
-            if self.has_ple:
-                hidden_states = self.root.run(x, input_ids=generated)
-            else:
-                hidden_states = self.root.run(x)
-            logits = self._compute_logits(hidden_states)
-            next_token_logits = logits[:, -1, :]
-            next_token = np.argmax(next_token_logits, axis=-1)
+        # ---- Prefill: full 64-token forward pass ----
+        x = self._embed(input_ids)
+        if self.has_ple:
+            hidden_states = self.root.run(x, kv_cache=kv_cache, prefill=True,
+                                           input_ids=input_ids)
+        else:
+            hidden_states = self.root.run(x, kv_cache=kv_cache, prefill=True)
+        logits = self._compute_logits(hidden_states)
+        next_token = self._sample(logits[:, -1, :], temperature)
 
-            piece = self.tokenizer.decode([int(next_token[0])])
-            output_pieces.append(piece)
-            if stream:
-                print(piece, end="", flush=True)
+        piece = self.tokenizer.decode([int(next_token[0, 0])])
+        output_pieces.append(piece)
+        if stream:
+            print(piece, end="", flush=True)
 
+        eos_id = self.tokenizer.eos_token_id
+
+        generated = input_ids.copy()
+
+        # ---- Decode steps: single-token KV-cached forward passes ----
+        for step in range(max_tokens - 1):
             generated = np.concatenate(
                 [generated, next_token.reshape(1, 1)], axis=1
             )
-            generated = generated[:, -self.seq_len:]
+
+            # Embed only the new token
+            x = self._embed(next_token.reshape(1, 1))
+
+            if self.has_ple:
+                hidden_states = self.root.run(
+                    x, kv_cache=kv_cache, prefill=False, input_ids=generated,
+                )
+            else:
+                hidden_states = self.root.run(
+                    x, kv_cache=kv_cache, prefill=False,
+                )
+            logits = self._compute_logits(hidden_states)
+            # For single-token decode, the only position is position 0
+            next_token = self._sample(logits[:, 0, :], temperature)
+
+            if eos_id is not None and int(next_token[0, 0]) == eos_id:
+                break
+
+            piece = self.tokenizer.decode([int(next_token[0, 0])])
+            output_pieces.append(piece)
+            if stream:
+                print(piece, end="", flush=True)
 
         if stream:
             print()

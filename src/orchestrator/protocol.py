@@ -7,3 +7,4 @@ MSG_ATTN_OUTPUT = 5
 MSG_FFN_RESULT = 6
 MSG_INIT_WEIGHTS = 7
 MSG_ALL_LAYERS_DONE = 8
+MSG_DECODE_STEP = 9  # (layer_idx, h_norm) → worker computes FFN for seq_len=1 decode

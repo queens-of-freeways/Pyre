@@ -20,6 +20,7 @@ from src.ffn.builder import build_ffn_graph
 from src.orchestrator.protocol import (
     MSG_SHARD_SPEC, MSG_READY, MSG_FORWARD_DATA, MSG_FORWARD_RESULT,
     MSG_SHUTDOWN, MSG_ATTN_OUTPUT, MSG_FFN_RESULT, MSG_INIT_WEIGHTS,
+    MSG_DECODE_STEP,
 )
 
 
@@ -124,9 +125,15 @@ class WorkerNode:
             self.local_seq_len = shard_spec.local_seq_len()
             self.hidden_dim = model_config.hidden_dim
 
+            full_seq_len = 64  # FFN runs on all positions, each node with its weight shard
             self.ffn_model = self.session.load(build_ffn_graph(
                 shard_spec, model_config.hidden_dim, self.device,
-                seq_len=self.local_seq_len, gated=True,
+                seq_len=full_seq_len, gated=True,
+            ))
+            # Decode FFN (seq_len=1) for autoregressive generation
+            self.ffn_decode_model = self.session.load(build_ffn_graph(
+                shard_spec, model_config.hidden_dim, self.device,
+                seq_len=1, gated=True,
             ))
 
             self._send_msg(conn, MSG_READY)
@@ -188,12 +195,25 @@ class WorkerNode:
                         (q.to_numpy(), k.to_numpy(), v.to_numpy()),
                     )
                 elif msg_type == MSG_ATTN_OUTPUT:
-                    (attn_slice,) = data
+                    (h_norm_full,) = data
                     (partial,) = self.ffn_model.execute(
-                        np.ascontiguousarray(attn_slice),
+                        np.ascontiguousarray(h_norm_full),
                         np.ascontiguousarray(self._current_ffn_gate),
                         np.ascontiguousarray(self._current_ffn_up),
                         np.ascontiguousarray(self._current_ffn_down),
+                    )
+                    self._send_msg(conn, MSG_FFN_RESULT, partial.to_numpy())
+                elif msg_type == MSG_DECODE_STEP:
+                    layer_idx, h_norm = data
+                    lw = self.layer_weights.get(layer_idx) if self.layer_weights else None
+                    if lw is None:
+                        lw = self._get_fallback_weights(layer_idx)
+                    fw = lw["ffn"]
+                    (partial,) = self.ffn_decode_model.execute(
+                        np.ascontiguousarray(h_norm),
+                        np.ascontiguousarray(fw["gate"]),
+                        np.ascontiguousarray(fw["up"]),
+                        np.ascontiguousarray(fw["down"]),
                     )
                     self._send_msg(conn, MSG_FFN_RESULT, partial.to_numpy())
                 elif msg_type == MSG_ALL_LAYERS_DONE:

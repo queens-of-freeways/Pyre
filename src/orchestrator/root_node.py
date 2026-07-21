@@ -8,6 +8,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
 from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import DeviceRef
@@ -19,6 +20,7 @@ from src.orchestrator.cluster import ModelConfig
 from src.orchestrator.protocol import (
     MSG_SHARD_SPEC, MSG_READY, MSG_FORWARD_DATA, MSG_FORWARD_RESULT,
     MSG_SHUTDOWN, MSG_ATTN_OUTPUT, MSG_FFN_RESULT, MSG_INIT_WEIGHTS,
+    MSG_DECODE_STEP,
 )
 
 
@@ -76,14 +78,32 @@ class RootNode:
             )
             self.attn_models[hd] = self.session.load(attn_graph)
 
+        full_seq_len = 64  # FFN runs on all positions, each node with its weight shard
         ffn_shard = FFNShardSpec(
             ffn_dim_start=p0["ffn_start"], ffn_dim_end=p0["ffn_end"],
         )
         ffn_graph = build_ffn_graph(
             ffn_shard, config.hidden_dim, self.device,
-            seq_len=seq_len, gated=True,
+            seq_len=full_seq_len, gated=True,
         )
         self.ffn_model = self.session.load(ffn_graph)
+
+        # Decode graphs (seq_len=1 for single-token autoregressive generation)
+        decode_attn_shard = AttentionShardSpec(
+            ffn_dim_start=0, ffn_dim_end=config.ffn_dim,
+            seq_start=0, seq_end=1,
+        )
+        self.attn_decode_models = {}
+        for hd in needed_hds:
+            dag = build_ulysses_attention_graph(
+                decode_attn_shard, config.hidden_dim, config.n_heads, config.n_kv_heads,
+                hd, self.device, full_q_weights=True,
+            )
+            self.attn_decode_models[hd] = self.session.load(dag)
+
+        self.ffn_decode_model = self.session.load(build_ffn_graph(
+            ffn_shard, config.hidden_dim, self.device, seq_len=1, gated=True,
+        ))
 
         self.worker_conns = []
         self.worker_ids = []
@@ -158,21 +178,22 @@ class RootNode:
         return (x_norm * weight).astype(np.float32)
 
     @staticmethod
-    def _apply_rope(x, rope_fraction=1.0, theta=10000.0):
+    def _apply_rope(x, rope_fraction=1.0, theta=10000.0, start_pos=0):
         batch, n_heads, seq_len, head_dim = x.shape
         dims = int(head_dim * rope_fraction)
         if dims < 2:
             return x
-        pos = np.arange(seq_len, dtype=np.float32)
+        half = dims // 2
+        pos = np.arange(start_pos, start_pos + seq_len, dtype=np.float32)
         freq = 1.0 / (theta ** (np.arange(0, dims, 2, dtype=np.float32) / dims))
         cos = np.cos(pos[:, None] * freq[None, :])
         sin = np.sin(pos[:, None] * freq[None, :])
         x_rot = x[:, :, :, :dims]
-        x_left = x_rot[..., ::2] * cos - x_rot[..., 1::2] * sin
-        x_right = x_rot[..., ::2] * sin + x_rot[..., 1::2] * cos
+        x1 = x_rot[..., :half]
+        x2 = x_rot[..., half:dims]
         out = x.copy()
-        out[:, :, :, :dims:2] = x_left
-        out[:, :, :, 1:dims:2] = x_right
+        out[:, :, :, :half] = x1 * cos - x2 * sin
+        out[:, :, :, half:dims] = x1 * sin + x2 * cos
         return out
 
     @staticmethod
@@ -181,7 +202,8 @@ class RootNode:
         return (v / rms).astype(np.float32)
 
     def _compute_attention(self, all_qkv, layer_idx: int = 0,
-                            kv_cache: Optional[dict] = None):
+                            kv_cache: Optional[dict] = None,
+                            decode_cache: Optional[dict] = None):
         head_dim = self.config.head_dim
         n_heads = self.config.n_heads
         n_kv = self.config.n_kv_heads
@@ -229,14 +251,22 @@ class RootNode:
 
         scale = np.float32(np.sqrt(head_dim))
         scores = q @ k_exp.transpose(0, 1, 3, 2) / scale
+
+        # Causal mask: each position can only attend to itself and earlier positions
+        mask = np.triu(np.full((full_seq, full_seq), -np.inf, dtype=np.float32), k=1)
+        scores = scores + mask
+
         scores = np.clip(scores, -500, 500)
         probs = self._softmax(scores, axis=-1)
         attn = probs @ v_exp
         attn = attn.transpose(0, 2, 1, 3).reshape(1, full_seq, n_heads * head_dim)
 
-        # Cache this layer's K,V if it might be shared by later layers
+        # Cache pre-RoPE K,V for KV sharing across layers (Gemma 4)
         if kv_source is None and kv_cache is not None:
             kv_cache[layer_idx] = (k_full, v_full)
+        # Cache post-RoPE K,V for decode-step autoregressive generation
+        if kv_source is None and decode_cache is not None:
+            decode_cache[layer_idx] = (k, v)
 
         return attn.astype(np.float32)
 
@@ -279,7 +309,8 @@ class RootNode:
         hidden_add = (hidden_add / np.sqrt(mean_sq + 1e-6) * ple_post_norm).astype(np.float32)
         return residual + hidden_add
 
-    def run(self, x: np.ndarray, input_ids: Optional[np.ndarray] = None) -> np.ndarray:
+    def run(self, x: np.ndarray, input_ids: Optional[np.ndarray] = None,
+            kv_cache: Optional[dict] = None, prefill: bool = True) -> np.ndarray:
         batch, seq_len, hidden_dim = x.shape
         assert hidden_dim == self.config.hidden_dim
 
@@ -288,22 +319,34 @@ class RootNode:
         else:
             num_layers = 1
 
+        if not prefill:
+            # Decode mode: x is [1, 1, hidden_dim] (single new token)
+            return self._decode_step(x, kv_cache, input_ids)
+
+        # Prefill mode: x is [1, seq_len, hidden_dim]
         # Pre-compute PLE signal once
         ple_all = self._compute_ple_signal(input_ids, x) if (
             self.ple_embedding is not None and input_ids is not None
         ) else None
 
-        kv_cache = {}
+        kv_cache_internal = {}
+        decode_cache = {}
         for layer_idx in range(num_layers):
             ple_slice = ple_all[:, :, layer_idx, :] if ple_all is not None else None
-            h = self._run_single_layer(x, layer_idx, ple_slice, kv_cache)
+            h = self._run_single_layer(x, layer_idx, ple_slice, kv_cache_internal, decode_cache)
             x = h
+
+        # Populate caller's kv_cache with decode-ready cache
+        if kv_cache is not None:
+            kv_cache.clear()
+            kv_cache.update(decode_cache)
 
         return x
 
     def _run_single_layer(self, x: np.ndarray, layer_idx: int,
                            ple_slice: Optional[np.ndarray] = None,
-                           kv_cache: Optional[dict] = None) -> np.ndarray:
+                           kv_cache: Optional[dict] = None,
+                           decode_cache: Optional[dict] = None) -> np.ndarray:
         batch, seq_len, hidden_dim = x.shape
         head_dim = self.config.head_dim
         n_heads = self.config.n_heads
@@ -327,9 +370,18 @@ class RootNode:
         x_root = x_norm[:, p0["seq_start"]:p0["seq_end"], :]
 
         layer_hd = root_w.get("_props", {}).get("head_dim", head_dim)
-        wq_r = rw_attn.get("q", np.random.randn(hidden_dim, n_heads * layer_hd).astype(np.float32))
-        wk_r = rw_attn.get("k", np.random.randn(hidden_dim, n_kv * layer_hd).astype(np.float32))
-        wv_r = rw_attn.get("v", np.random.randn(hidden_dim, n_kv * layer_hd).astype(np.float32))
+        wq_r = rw_attn.get("q")
+        if wq_r is None:
+            wq_r = np.random.randn(hidden_dim, n_heads * layer_hd).astype(np.float32)
+            rw_attn["q"] = wq_r
+        wk_r = rw_attn.get("k")
+        if wk_r is None:
+            wk_r = np.random.randn(hidden_dim, n_kv * layer_hd).astype(np.float32)
+            rw_attn["k"] = wk_r
+        wv_r = rw_attn.get("v")
+        if wv_r is None:
+            wv_r = np.random.randn(hidden_dim, n_kv * layer_hd).astype(np.float32)
+            rw_attn["v"] = wv_r
 
         hd = root_w.get("_props", {}).get("head_dim", self.config.head_dim)
         attn_model = self.attn_models.get(hd, list(self.attn_models.values())[0])
@@ -357,7 +409,7 @@ class RootNode:
             all_qkv[worker_id] = qkv
 
         # ---- Attention (with RoPE applied inside) ----
-        attn_out = self._compute_attention(all_qkv, layer_idx, kv_cache)
+        attn_out = self._compute_attention(all_qkv, layer_idx, kv_cache, decode_cache)
 
         # Output projection
         o_weight = root_w.get("attn", {}).get("o")
@@ -375,39 +427,36 @@ class RootNode:
             variance = np.mean(h.astype(np.float64) ** 2, axis=-1, keepdims=True)
             h_norm = (h / np.sqrt(variance + 1e-6)).astype(np.float32)
 
-        # ---- Send normed slices to workers for FFN ----
-        for idx, worker_id in enumerate(self.worker_ids):
-            p = self.partitions[worker_id]
-            self._send_msg(self.worker_conns[idx], MSG_ATTN_OUTPUT, (h_norm[:, p["seq_start"]:p["seq_end"], :],))
-
-        partials = {}
-        for idx, worker_id in enumerate(self.worker_ids):
-            _, partial = self._recv_msg(self.worker_conns[idx])
-            partials[worker_id] = partial
-
-        # ---- Root FFN on normed hidden ----
-        attn_root = h_norm[:, p0["seq_start"]:p0["seq_end"], :]
-        width0 = p0["ffn_end"] - p0["ffn_start"]
-
+        # ---- FFN: each node computes ALL positions with its weight shard, then sum ----
         rw_ffn = root_w.get("ffn", {})
-        ffn_gate_r = rw_ffn.get("gate", np.random.randn(hidden_dim, width0).astype(np.float32))
-        ffn_up_r = rw_ffn.get("up", np.random.randn(hidden_dim, width0).astype(np.float32))
-        ffn_down_r = rw_ffn.get("down", np.random.randn(width0, hidden_dim).astype(np.float32))
+        p0 = self.partitions[0]
+        width0 = p0["ffn_end"] - p0["ffn_start"]
+        ffn_gate_r = rw_ffn.get("gate")
+        if ffn_gate_r is None:
+            ffn_gate_r = np.random.randn(hidden_dim, width0).astype(np.float32)
+            rw_ffn["gate"] = ffn_gate_r
+        ffn_up_r = rw_ffn.get("up")
+        if ffn_up_r is None:
+            ffn_up_r = np.random.randn(hidden_dim, width0).astype(np.float32)
+            rw_ffn["up"] = ffn_up_r
+        ffn_down_r = rw_ffn.get("down")
+        if ffn_down_r is None:
+            ffn_down_r = np.random.randn(width0, hidden_dim).astype(np.float32)
+            rw_ffn["down"] = ffn_down_r
 
         (partial_root,) = self.ffn_model.execute(
-            np.ascontiguousarray(attn_root),
+            np.ascontiguousarray(h_norm),
             np.ascontiguousarray(ffn_gate_r),
             np.ascontiguousarray(ffn_up_r),
             np.ascontiguousarray(ffn_down_r),
         )
-        partial_root = partial_root.to_numpy()
+        ffn_out = partial_root.to_numpy()  # root's shard contribution for ALL positions
 
-        # ---- Sum FFN partials ----
-        ffn_out = np.zeros((batch, seq_len, hidden_dim), dtype=np.float32)
-        ffn_out[:, p0["seq_start"]:p0["seq_end"], :] += partial_root
-        for worker_id in self.worker_ids:
-            p = self.partitions[worker_id]
-            ffn_out[:, p["seq_start"]:p["seq_end"], :] += partials[worker_id]
+        for idx, worker_id in enumerate(self.worker_ids):
+            # Send the FULL h_norm (all positions) to each worker for its FFN shard
+            self._send_msg(self.worker_conns[idx], MSG_ATTN_OUTPUT, (h_norm,))
+            _, partial = self._recv_msg(self.worker_conns[idx])
+            ffn_out += partial  # sum shards per position
 
         # ---- Residual: output = h + ffn_out ----
         final_output = h + ffn_out
@@ -424,6 +473,202 @@ class RootNode:
                 )
 
         return final_output
+
+    def _decode_step(self, x: np.ndarray, decode_cache: dict,
+                      input_ids: Optional[np.ndarray] = None) -> np.ndarray:
+        """Single-token decode step using KV cache. x is [1, 1, hidden_dim]."""
+        if self.all_layer_weights and 0 in self.all_layer_weights:
+            num_layers = len(self.all_layer_weights[0])
+        else:
+            num_layers = 1
+
+        # PLE for decode: compute signal just for the new position
+        ple_all = None
+        if self.ple_embedding is not None and input_ids is not None:
+            ple_all = self._compute_ple_signal(input_ids, x)
+            # ple_all: [1, total_seq, num_layers, ple_dim], extract last position
+            ple_all = ple_all[:, -1:, :, :]
+
+        for layer_idx in range(num_layers):
+            ple_slice = ple_all[:, :, layer_idx, :] if ple_all is not None else None
+            x = self._decode_single_layer(x, layer_idx, decode_cache, ple_slice)
+
+        return x
+
+    def _decode_single_layer(self, x: np.ndarray, layer_idx: int,
+                              decode_cache: dict,
+                              ple_slice: Optional[np.ndarray] = None) -> np.ndarray:
+        """Decode one transformer layer for a single new token with KV cache."""
+        batch, seq_len, hidden_dim = x.shape  # seq_len == 1
+        head_dim = self.config.head_dim
+        n_heads = self.config.n_heads
+        n_kv = self.config.n_kv_heads
+
+        root_w = {}
+        if self.all_layer_weights and 0 in self.all_layer_weights:
+            root_w = self.all_layer_weights[0].get(layer_idx, {})
+        rw_attn = root_w.get("attn", {})
+
+        # ---- Pre-attention RMSNorm ----
+        input_ln = root_w.get("input_layernorm")
+        if input_ln is not None:
+            x_norm = self._rms_norm(x, input_ln)
+        else:
+            variance = np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True)
+            x_norm = (x / np.sqrt(variance + 1e-6)).astype(np.float32)
+
+        # ---- QKV projection for the single token (torch for fast small matmuls) ----
+        layer_hd = root_w.get("_props", {}).get("head_dim", head_dim)
+        wq_r = rw_attn.get("q")
+        if wq_r is None:
+            wq_r = np.random.randn(hidden_dim, n_heads * layer_hd).astype(np.float32)
+            rw_attn["q"] = wq_r
+        wk_r = rw_attn.get("k")
+        if wk_r is None:
+            wk_r = np.random.randn(hidden_dim, n_kv * layer_hd).astype(np.float32)
+            rw_attn["k"] = wk_r
+        wv_r = rw_attn.get("v")
+        if wv_r is None:
+            wv_r = np.random.randn(hidden_dim, n_kv * layer_hd).astype(np.float32)
+            rw_attn["v"] = wv_r
+
+        xn_t = torch.from_numpy(x_norm)[0]  # [1, 576]
+        wq_t = torch.from_numpy(wq_r)
+        wk_t = torch.from_numpy(wk_r)
+        q_t = torch.mm(xn_t, wq_t)
+        k_t = torch.mm(xn_t, wk_t)
+        q = q_t.reshape(1, 1, n_heads, layer_hd).numpy()
+        k = k_t.reshape(1, 1, n_kv, layer_hd).numpy()
+        if wv_r is not None:
+            v_t = torch.mm(xn_t, torch.from_numpy(wv_r))
+            v = v_t.reshape(1, 1, n_kv, layer_hd).numpy()
+        else:
+            v = k.copy()
+
+        q_rope = q.transpose(0, 2, 1, 3)   # [1, n_heads, 1, head_dim]
+        k_rope = k.transpose(0, 2, 1, 3)   # [1, n_kv, 1, head_dim]
+        v_out = v.transpose(0, 2, 1, 3)    # [1, n_kv, 1, head_dim]
+
+        # ---- Apply RoPE to new Q,K for the current sequence position ----
+        props = root_w.get("_props", {})
+        rope_frac = props.get("rope_fraction", 1.0)
+        theta = getattr(self.config, 'rope_theta', 10000.0)
+        cache_len = 0
+        if layer_idx in decode_cache:
+            cache_len = decode_cache[layer_idx][0].shape[2]  # seq dim after transpose
+        if rope_frac > 0:
+            q_rope = self._apply_rope(q_rope, rope_fraction=rope_frac,
+                                       theta=theta, start_pos=cache_len)
+            k_rope = self._apply_rope(k_rope, rope_fraction=rope_frac,
+                                       theta=theta, start_pos=cache_len)
+
+        # ---- Append to KV cache ----
+        if layer_idx in decode_cache:
+            cached_k, cached_v = decode_cache[layer_idx]
+            k_full = np.concatenate([cached_k, k_rope], axis=2)
+            v_full = np.concatenate([cached_v, v_out], axis=2)
+        else:
+            k_full = k_rope
+            v_full = v_out
+        decode_cache[layer_idx] = (k_full, v_full)
+
+        # ---- Clipping ----
+        q_rope = np.clip(q_rope, -1000, 1000)
+        k_full = np.clip(k_full, -1000, 1000)
+        v_full = np.clip(v_full, -1000, 1000)
+
+        # ---- Attention with cached K,V ----
+        attn_out = self._compute_attention_decode(q_rope, k_full, v_full, layer_idx)
+
+        # ---- Output projection (torch) ----
+        o_weight = root_w.get("attn", {}).get("o")
+        if o_weight is not None:
+            ao_t = torch.mm(torch.from_numpy(attn_out.reshape(-1, attn_out.shape[-1])),
+                            torch.from_numpy(o_weight))
+            attn_out = ao_t.reshape(attn_out.shape).numpy()
+
+        # ---- Residual: h = x + attn_out ----
+        h = x + attn_out
+
+        # ---- Pre-FFN RMSNorm ----
+        post_attn_ln = root_w.get("post_attention_layernorm")
+        if post_attn_ln is not None:
+            h_norm = self._rms_norm(h, post_attn_ln)
+        else:
+            variance = np.mean(h.astype(np.float64) ** 2, axis=-1, keepdims=True)
+            h_norm = (h / np.sqrt(variance + 1e-6)).astype(np.float32)
+
+        # ---- FFN (tensor-parallel: root shard + worker shard, torch for speed) ----
+        rw_ffn = root_w.get("ffn", {})
+        p0 = self.partitions[0]
+        width0 = p0["ffn_end"] - p0["ffn_start"]
+        ffn_gate_r = rw_ffn.get("gate")
+        if ffn_gate_r is None:
+            ffn_gate_r = np.random.randn(hidden_dim, width0).astype(np.float32)
+            rw_ffn["gate"] = ffn_gate_r
+        ffn_up_r = rw_ffn.get("up")
+        if ffn_up_r is None:
+            ffn_up_r = np.random.randn(hidden_dim, width0).astype(np.float32)
+            rw_ffn["up"] = ffn_up_r
+        ffn_down_r = rw_ffn.get("down")
+        if ffn_down_r is None:
+            ffn_down_r = np.random.randn(width0, hidden_dim).astype(np.float32)
+            rw_ffn["down"] = ffn_down_r
+
+        hn_t = torch.from_numpy(h_norm)[0]  # [1, 576]
+        gate_t = torch.mm(hn_t, torch.from_numpy(ffn_gate_r))
+        up_t = torch.mm(hn_t, torch.from_numpy(ffn_up_r))
+        gate_sig = torch.sigmoid(gate_t)
+        hidden_t = gate_t * gate_sig * up_t
+        ffn_t = torch.mm(hidden_t, torch.from_numpy(ffn_down_r))
+        ffn_out = ffn_t.numpy().reshape(h_norm.shape)
+
+        for idx, worker_id in enumerate(self.worker_ids):
+            self._send_msg(self.worker_conns[idx], MSG_DECODE_STEP,
+                           (layer_idx, h_norm))
+            _, partial = self._recv_msg(self.worker_conns[idx])
+            ffn_out += partial
+
+        # ---- Residual: output = h + ffn_out ----
+        final_output = h + ffn_out
+
+        # ---- Apply PLE ----
+        if ple_slice is not None:
+            ple_gate = root_w.get("ple_gate")
+            if ple_gate is not None:
+                final_output = self._apply_ple_to_hidden(
+                    final_output, ple_slice,
+                    ple_gate, root_w["ple_proj"], root_w["ple_post_norm"],
+                )
+
+        return final_output
+
+    @staticmethod
+    def _compute_attention_decode(q, k, v, layer_idx=0):
+        """Compute attention for a single Q token against cached K,V.
+
+        q: [1, n_heads, 1, head_dim] (RoPE'd for current position)
+        k: [1, n_kv, cache_len, head_dim] (all positions RoPE'd)
+        v: [1, n_kv, cache_len, head_dim]
+        """
+        n_heads = q.shape[1]
+        n_kv = k.shape[1]
+        head_dim = q.shape[3]
+        full_seq = k.shape[2]
+
+        n_q_per_kv = n_heads // n_kv
+        k_exp = k[:, :, None, :, :].repeat(n_q_per_kv, axis=2).reshape(1, n_heads, full_seq, head_dim)
+        v_exp = v[:, :, None, :, :].repeat(n_q_per_kv, axis=2).reshape(1, n_heads, full_seq, head_dim)
+
+        scale = np.float32(np.sqrt(head_dim))
+        scores = q @ k_exp.transpose(0, 1, 3, 2) / scale
+
+        scores = np.clip(scores, -500, 500)
+        probs = RootNode._softmax(scores, axis=-1)
+        attn = probs @ v_exp
+        attn = attn.transpose(0, 2, 1, 3).reshape(1, 1, n_heads * head_dim)
+
+        return attn.astype(np.float32)
 
     def shutdown(self):
         for conn in self.worker_conns:
