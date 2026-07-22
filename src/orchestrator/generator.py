@@ -185,20 +185,14 @@ def _build_gen(
 
     wp = WeightProvider(model, partitions, num_layers=num_layers, use_cache=not reload)
 
-    # Build only root weights (views, no copies). Workers get weights on-demand via weight_provider.
-    root_weights = {0: wp.get_root_weights(0)}
-
     has_ple = wp.ple_dim > 0
     root = RootNode(
         worker_addrs, config,
-        all_layer_weights=root_weights,
         weight_provider=wp,
         ple_embedding=wp.get_ple_embedding() if has_ple else None,
         ple_projection=wp.get_ple_projection() if has_ple else None,
         ple_projection_norm=wp.get_ple_projection_norm() if has_ple else None,
     )
-    # weight_provider is kept alive by RootNode; free no-longer-needed large arrays
-    del root_weights
 
     tokenizer = AutoTokenizer.from_pretrained(model)
     if tokenizer.pad_token is None:

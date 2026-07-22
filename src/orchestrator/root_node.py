@@ -53,10 +53,6 @@ class RootNode:
         seq_len = p0["seq_end"] - p0["seq_start"]
 
         needed_hds = {config.head_dim}
-        if self.all_layer_weights and 0 in self.all_layer_weights:
-            for lidx, lw in self.all_layer_weights[0].items():
-                p = lw.get("_props", {})
-                needed_hds.add(p.get("head_dim", config.head_dim))
 
         attn_shard_base = AttentionShardSpec(
             ffn_dim_start=p0["ffn_start"], ffn_dim_end=p0["ffn_end"],
@@ -193,13 +189,13 @@ class RootNode:
 
     def _compute_attention(self, all_qkv, layer_idx: int = 0,
                             kv_cache: Optional[dict] = None,
-                            decode_cache: Optional[dict] = None):
+                            decode_cache: Optional[dict] = None,
+                            props: Optional[dict] = None) -> np.ndarray:
         head_dim = self.config.head_dim
         n_heads = self.config.n_heads
         n_kv = self.config.n_kv_heads
 
-        props = self.all_layer_weights.get(0, {}).get(layer_idx, {}).get("_props", {})
-        kv_source = props.get("kv_source_layer", None)
+        kv_source = (props or {}).get("kv_source_layer", None)
         if kv_source is not None and kv_cache is not None and kv_source in kv_cache:
             k_cached, v_cached = kv_cache[kv_source]
             ids = [0] + self.worker_ids
@@ -290,10 +286,7 @@ class RootNode:
         batch, seq_len, hidden_dim = x.shape
         assert hidden_dim == self.config.hidden_dim
 
-        if self.all_layer_weights and 0 in self.all_layer_weights:
-            num_layers = len(self.all_layer_weights[0])
-        else:
-            num_layers = 1
+        num_layers = self.config.num_layers
 
         self.adaptive_partitioner.reset_pass()
 
@@ -333,9 +326,7 @@ class RootNode:
         n_heads = self.config.n_heads
         n_kv = self.config.n_kv_heads
 
-        root_w = {}
-        if self.all_layer_weights and 0 in self.all_layer_weights:
-            root_w = self.all_layer_weights[0].get(layer_idx, {})
+        root_w = self._get_root_layer_weights(layer_idx)
         rw_attn = root_w.get("attn", {})
 
         input_ln = root_w.get("input_layernorm")
@@ -406,7 +397,8 @@ class RootNode:
                 v_w = v_w + v_bias.reshape(1, 1, n_kv, layer_hd)
             all_qkv[worker_id] = (q_w, k_w, v_w)
 
-        attn_out = self._compute_attention(all_qkv, layer_idx, kv_cache, decode_cache)
+        attn_out = self._compute_attention(all_qkv, layer_idx, kv_cache, decode_cache,
+                                            props=root_w.get("_props", {}))
 
         o_weight = root_w.get("attn", {}).get("o")
         if o_weight is not None:
@@ -475,10 +467,7 @@ class RootNode:
 
     def _decode_step(self, x: np.ndarray, decode_cache: dict,
                       input_ids: Optional[np.ndarray] = None) -> np.ndarray:
-        if self.all_layer_weights and 0 in self.all_layer_weights:
-            num_layers = len(self.all_layer_weights[0])
-        else:
-            num_layers = 1
+        num_layers = self.config.num_layers
 
         ple_all = None
         if self.ple_embedding is not None and input_ids is not None:
@@ -504,9 +493,7 @@ class RootNode:
         n_heads = self.config.n_heads
         n_kv = self.config.n_kv_heads
 
-        root_w = {}
-        if self.all_layer_weights and 0 in self.all_layer_weights:
-            root_w = self.all_layer_weights[0].get(layer_idx, {})
+        root_w = self._get_root_layer_weights(layer_idx)
         rw_attn = root_w.get("attn", {})
 
         input_ln = root_w.get("input_layernorm")
@@ -680,6 +667,37 @@ class RootNode:
         attn = attn.transpose(0, 2, 1, 3).reshape(1, 1, n_heads * head_dim)
 
         return attn.astype(np.float32)
+
+    def _get_root_layer_weights(self, layer_idx: int) -> dict:
+        """Load one layer's weights from the weight provider on demand.
+
+        Avoids holding all root layers in RAM simultaneously.
+        Falls back to ``all_layer_weights[0]`` when no weight_provider.
+        """
+        if self._wp is not None:
+            return self._wp._layer_weights_for_node(
+                layer_idx, self.partitions[0], full_q=True, copy_weights=True,
+            )
+        if self.all_layer_weights and 0 in self.all_layer_weights:
+            return self.all_layer_weights[0].get(layer_idx, {})
+        return {}
+
+    def _get_root_props(self, layer_idx: int) -> dict:
+        """Get just the _props dict for a layer (used by _compute_attention)."""
+        if self._wp is not None:
+            # LayerProperties are cheap — get them from the partitioner
+            lp = self._wp.get_layer_props(layer_idx)
+            return {
+                "head_dim": lp.head_dim,
+                "has_v_proj": lp.has_v_proj,
+                "rope_fraction": lp.rope_fraction,
+                "use_v_norm": lp.use_v_norm,
+                "attention_type": lp.attention_type,
+                "kv_source_layer": lp.kv_source_layer,
+            }
+        if self.all_layer_weights and 0 in self.all_layer_weights:
+            return self.all_layer_weights[0].get(layer_idx, {}).get("_props", {})
+        return {}
 
     def shutdown(self):
         for conn in self.worker_conns:

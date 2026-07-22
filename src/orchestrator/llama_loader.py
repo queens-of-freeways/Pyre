@@ -820,7 +820,12 @@ class _FullWeightsProxy:
     @property
     def lm_head(self) -> np.ndarray:
         if self._lm_head is None:
-            self._lm_head = self._sw.get_lm_head()
+            ekey = self._sw._key_info["embed_key"]
+            lkey = self._sw._key_info["lm_head_key"]
+            if lkey == ekey:
+                self._lm_head = self.embedding  # tied: share the same array
+            else:
+                self._lm_head = self._sw.get_lm_head()
         return self._lm_head
 
     @property
