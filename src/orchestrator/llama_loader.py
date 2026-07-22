@@ -741,21 +741,23 @@ class _ShapeState:
         return len(self._index)
 
 
-class _LazyLayerDict(dict):
-    """Looks like a dict[layer_idx] → LayerWeightSet, loads from StreamingWeights on access."""
+class _LazyLayerDict:
+    """Looks like a dict[layer_idx] → LayerWeightSet, loads from StreamingWeights on access.
+
+    No caching — each access calls get_layer() which reads from mmap and returns
+    fresh bf16 copies.  Never holds all layers in RAM.
+    """
     def __init__(self, sw: 'StreamingWeights'):
-        super().__init__()
         self._sw = sw
 
     def __getitem__(self, idx):
-        # Check dict storage directly (bypass overridden __contains__)
-        if not dict.__contains__(self, idx):
-            lw = self._sw.get_layer(idx)
-            dict.__setitem__(self, idx, lw)
-        return dict.__getitem__(self, idx)
+        return self._sw.get_layer(idx)
 
     def __contains__(self, idx):
-        return dict.__contains__(self, idx)
+        return 0 <= idx < self._sw.num_layers
+
+    def __iter__(self):
+        return iter(range(self._sw.num_layers))
 
     def __len__(self):
         return self._sw.num_layers
@@ -773,7 +775,6 @@ class _LazyLayerDict(dict):
 
     def get(self, idx, default=None):
         try:
-            # dict.get() uses our __getitem__ which does lazy loading
             return self[idx]
         except (KeyError, IndexError, TypeError):
             return default

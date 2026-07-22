@@ -52,10 +52,19 @@ def quantize_weights_dict(weights: dict) -> dict:
     return qd
 
 
-def dequantize_weights_dict(qd: dict) -> dict:
-    """Recursively dequantize all Q8_0 entries in a dict."""
+def dequantize_weights_dict(qd: dict, subset: str = "") -> dict:
+    """Recursively dequantize all Q8_0 entries in a dict.
+
+    If *subset* is set to a top-level key (e.g. ``"ffn"``), only that
+    subtree is dequantized; all other top-level keys are returned as-is.
+    This avoids decompressing attention weights when only FFN is needed
+    (decode steps).
+    """
     result = {}
     for k, v in qd.items():
+        if subset and k != subset:
+            result[k] = v
+            continue
         if isinstance(v, dict):
             result[k] = dequantize_weights_dict(v)
         elif isinstance(v, tuple) and v[0] == "q8":

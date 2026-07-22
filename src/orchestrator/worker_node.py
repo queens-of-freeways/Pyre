@@ -239,8 +239,18 @@ class WorkerNode:
                     send_msg(conn, MSG_FFN_RESULT, partial.to_numpy())
                 elif msg_type == MSG_DECODE_STEP:
                     layer_idx, h_norm = data
-                    lw = self._get_dequantized(layer_idx)
-                    fw = lw["ffn"]
+                    cw = self._compressed.get(layer_idx)
+                    if cw is None:
+                        fw = self._get_fallback_weights(layer_idx)["ffn"]
+                    else:
+                        ffn_q = cw.get("ffn", {})
+                        if isinstance(ffn_q, dict) and any(
+                            isinstance(v, tuple) and v[0] == "q8"
+                            for v in ffn_q.values() if isinstance(v, tuple)
+                        ):
+                            fw = dequantize_weights_dict(ffn_q)
+                        else:
+                            fw = ffn_q
                     (partial,) = self.ffn_decode_model.execute(
                         np.ascontiguousarray(h_norm),
                         np.ascontiguousarray(fw["gate"]),
@@ -248,7 +258,6 @@ class WorkerNode:
                         np.ascontiguousarray(fw["down"]),
                     )
                     send_msg(conn, MSG_FFN_RESULT, partial.to_numpy())
-                    self._free_dequantized(layer_idx)
                 elif msg_type == MSG_ALL_LAYERS_DONE:
                     pass
 
