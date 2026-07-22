@@ -4,6 +4,8 @@ def _ensure_imports():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if root not in sys.path:
         sys.path.insert(0, root)
+    # Auto-detect MODULAR_HOME so MAX/DLPack imports work outside pixi run
+    os.environ.setdefault("MODULAR_HOME", os.path.expanduser("~/.modular"))
     import multiprocessing
     multiprocessing.set_start_method("fork", force=True)
 

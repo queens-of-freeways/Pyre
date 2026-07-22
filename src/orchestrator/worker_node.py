@@ -19,7 +19,7 @@ from src.orchestrator.net import send_msg, recv_msg, recv_exact
 from src.orchestrator.protocol import (
     MSG_SHARD_SPEC, MSG_READY, MSG_FORWARD_DATA, MSG_FORWARD_RESULT,
     MSG_SHUTDOWN, MSG_ATTN_OUTPUT, MSG_FFN_RESULT, MSG_INIT_WEIGHTS,
-    MSG_DECODE_STEP,
+    MSG_DECODE_STEP, MSG_LAYER_WEIGHTS,
 )
 from src.orchestrator.quantizer import dequantize_weights_dict
 
@@ -133,24 +133,37 @@ class WorkerNode:
 
             send_msg(conn, MSG_READY)
 
-            init_data = recv_msg(conn)
-            msg_type, payload = init_data
-            if msg_type != MSG_INIT_WEIGHTS:
-                raise ValueError(f"Expected INIT_WEIGHTS, got {msg_type}")
+            # Receive layers one at a time via MSG_LAYER_WEIGHTS (streaming)
+            self.layer_weights = {}
+            self.layer_props = {}
+            num_layers = self.config.num_layers
+            for layer_idx in range(num_layers):
+                msg_type, payload = recv_msg(conn)
+                if msg_type == MSG_LAYER_WEIGHTS:
+                    lidx, layer_payload = payload
+                elif msg_type == MSG_INIT_WEIGHTS:
+                    # Fallback: batch receive all layers at once
+                    layer_payload = payload
+                    if isinstance(layer_payload, dict):
+                        layer_payload = dequantize_weights_dict(layer_payload)
+                    self.layer_weights = layer_payload.get("weights", {})
+                    self.layer_props = layer_payload.get("props", {})
+                    break
+                else:
+                    raise ValueError(
+                        f"Expected LAYER_WEIGHTS ({MSG_LAYER_WEIGHTS}) "
+                        f"or INIT_WEIGHTS ({MSG_INIT_WEIGHTS}), got {msg_type}"
+                    )
 
-            # Dequantize if compressed with Q8_0
-            if isinstance(payload, dict):
-                payload = dequantize_weights_dict(payload)
+                if isinstance(layer_payload, dict):
+                    layer_payload = dequantize_weights_dict(layer_payload)
 
-            self.layer_weights = payload.get("weights", {})
-            self.layer_props = payload.get("props", {})
-            self.layer_graph_key = payload.get("graph_key", {})
+                self.layer_weights[lidx] = layer_payload
+                self.layer_props[lidx] = layer_payload.get("_props", {})
 
             needed_hds = set()
             for lp in self.layer_props.values():
                 needed_hds.add(lp.get("head_dim", model_config.head_dim))
-            for lp_key in self.layer_graph_key.values():
-                needed_hds.add(lp_key[0])
             if not needed_hds:
                 needed_hds.add(model_config.head_dim)
 

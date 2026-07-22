@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import socket
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -14,12 +14,12 @@ from max.driver import CPU
 
 from src.attention.builder import build_ulysses_attention_graph, ShardSpec as AttentionShardSpec
 from src.ffn.builder import build_ffn_graph, ShardSpec as FFNShardSpec
-from src.orchestrator.cluster import ModelConfig
+from src.orchestrator.cluster import ModelConfig, AdaptivePartitioner
 from src.orchestrator.net import send_msg, recv_msg, recv_exact
 from src.orchestrator.protocol import (
     MSG_SHARD_SPEC, MSG_READY, MSG_FORWARD_DATA, MSG_FORWARD_RESULT,
     MSG_SHUTDOWN, MSG_ATTN_OUTPUT, MSG_FFN_RESULT, MSG_INIT_WEIGHTS,
-    MSG_DECODE_STEP,
+    MSG_DECODE_STEP, MSG_LAYER_WEIGHTS,
 )
 from src.orchestrator.quantizer import quantize_weights_dict
 
@@ -82,6 +82,12 @@ class RootNode:
 
         self.worker_conns = []
         self.worker_ids = []
+
+        # ── Adaptive Partitioning ──────────────────────────────────────
+        total_nodes = 1 + len(worker_addrs)
+        self.adaptive_partitioner = AdaptivePartitioner(
+            config.ffn_dim, total_nodes, seq_len=64,
+        )
         for i, (host, port) in enumerate(worker_addrs):
             worker_id = i + 1
             conn = self._connect_worker(host, port)
@@ -95,32 +101,25 @@ class RootNode:
             if msg_type != MSG_READY:
                 raise RuntimeError(f"Expected READY from worker {worker_id}, got {msg_type}")
 
-            # Build worker weights on-demand, quantize, send, then free memory
-            worker_data = {"weights": {}, "props": {}, "graph_key": {}}
+            # Stream layer weights one at a time (never hold all layers in RAM)
             if weight_provider is not None:
-                wl = weight_provider.get_node_weights(worker_id, total_nodes)
-                worker_data["weights"] = {k: v for k, v in wl.items()}
-                for lidx, lw in wl.items():
-                    lp = lw.get("_props", {})
-                    worker_data["props"][lidx] = lp
-                    hd = lp.get("head_dim", config.head_dim)
-                    worker_data["graph_key"][lidx] = (hd, 0, 0, 0, 0)
-                del wl
+                for layer_idx in range(config.num_layers):
+                    lw = weight_provider._layer_weights_for_node(
+                        layer_idx, p, full_q=True, copy_weights=True,
+                    )
+                    lw_q = quantize_weights_dict(lw)
+                    send_msg(conn, MSG_LAYER_WEIGHTS, (layer_idx, lw_q))
+                    del lw, lw_q
             elif all_layer_weights and worker_id in all_layer_weights:
+                # Fallback: batch send (pre-computed weights)
                 wl = all_layer_weights[worker_id]
-                worker_data["weights"] = {k: v for k, v in wl.items()}
+                worker_data = {"weights": {k: v for k, v in wl.items()}}
                 for lidx, lw in wl.items():
                     lp = lw.get("_props", {})
-                    worker_data["props"][lidx] = lp
-                    hd = lp.get("head_dim", config.head_dim)
-                    worker_data["graph_key"][lidx] = (hd, 0, 0, 0, 0)
-                # Free worker weight copies from memory after sending
-                del all_layer_weights[worker_id]
-            # Quantize before sending (4x compression for pickle)
-            worker_data_q = quantize_weights_dict(worker_data)
-            del worker_data
-            send_msg(conn, MSG_INIT_WEIGHTS, worker_data_q)
-            del worker_data_q
+                    worker_data.setdefault("props", {})[lidx] = lp
+                worker_data_q = quantize_weights_dict(worker_data)
+                send_msg(conn, MSG_INIT_WEIGHTS, worker_data_q)
+                del worker_data, worker_data_q, all_layer_weights[worker_id]
 
             self.worker_conns.append(conn)
             self.worker_ids.append(worker_id)
@@ -296,6 +295,8 @@ class RootNode:
         else:
             num_layers = 1
 
+        self.adaptive_partitioner.reset_pass()
+
         if not prefill:
             return self._decode_step(x, kv_cache, input_ids)
 
@@ -313,6 +314,13 @@ class RootNode:
         if kv_cache is not None:
             kv_cache.clear()
             kv_cache.update(decode_cache)
+
+        if self.adaptive_partitioner.drift_detected():
+            new_parts = self.adaptive_partitioner.get_partitions()
+            # Log but don't apply mid-run — apply on next init for now
+            print(f"[Adaptive] Drift detected. New root FFN: "
+                  f"[{new_parts[0]['ffn_start']}:{new_parts[0]['ffn_end']}) "
+                  f"(was [{self.partitions[0]['ffn_start']}:{self.partitions[0]['ffn_end']}))")
 
         return x
 
@@ -437,10 +445,19 @@ class RootNode:
         )
         ffn_out = partial_root.to_numpy()
 
+        # Broadcast FFN input to all workers (true parallelism), then collect
         for idx, worker_id in enumerate(self.worker_ids):
             send_msg(self.worker_conns[idx], MSG_ATTN_OUTPUT, (h_norm,))
+
+        worker_timings = {}
+        for idx, worker_id in enumerate(self.worker_ids):
+            t0 = time.time()
             _, partial = recv_msg(self.worker_conns[idx])
+            elapsed = time.time() - t0
+            worker_timings[worker_id] = elapsed
             ffn_out += partial
+
+        self.adaptive_partitioner.update(worker_timings)
 
         final_output = h + ffn_out
 
@@ -471,6 +488,11 @@ class RootNode:
         for layer_idx in range(num_layers):
             ple_slice = ple_all[:, :, layer_idx, :] if ple_all is not None else None
             x = self._decode_single_layer(x, layer_idx, decode_cache, ple_slice)
+
+        if self.adaptive_partitioner.drift_detected():
+            new_parts = self.adaptive_partitioner.get_partitions()
+            print(f"[Adaptive] Decode drift. New root FFN: "
+                  f"[{new_parts[0]['ffn_start']}:{new_parts[0]['ffn_end']})")
 
         return x
 
@@ -611,11 +633,20 @@ class RootNode:
         ffn_t = torch.mm(hidden_t, torch.from_numpy(ffn_down_r))
         ffn_out = ffn_t.numpy().reshape(h_norm.shape)
 
+        # Broadcast decode step to all workers, then collect
         for idx, worker_id in enumerate(self.worker_ids):
             send_msg(self.worker_conns[idx], MSG_DECODE_STEP,
                            (layer_idx, h_norm))
+
+        decode_timings = {}
+        for idx, worker_id in enumerate(self.worker_ids):
+            t0 = time.time()
             _, partial = recv_msg(self.worker_conns[idx])
+            elapsed = time.time() - t0
+            decode_timings[worker_id] = elapsed
             ffn_out += partial
+
+        self.adaptive_partitioner.update(decode_timings)
 
         final_output = h + ffn_out
 

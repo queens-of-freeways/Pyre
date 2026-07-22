@@ -712,16 +712,400 @@ def _slice_ffn_for_node(full: FullWeights, layer_idx: int, ffn_start: int, ffn_e
     }
 
 
+# ── StreamingWeight: memory-mapped safetensors, one layer at a time ──
+
+_DTYPE_SIZE = {'BF16': 2, 'F32': 4, 'F16': 2, 'I64': 8, 'I32': 4, 'I16': 2, 'I8': 1, 'U8': 1}
+
+
+class _ShapeState:
+    """Minimal dict-like that exposes tensor names and shapes without loading data."""
+    def __init__(self, tensor_index: dict):
+        self._index = tensor_index
+
+    def __getitem__(self, key):
+        class _ShapeProxy:
+            def __init__(self, shape):
+                self.shape = tuple(shape)
+        return _ShapeProxy(self._index[key]['shape'])
+
+    def __contains__(self, key):
+        return key in self._index
+
+    def keys(self):
+        return self._index.keys()
+
+    def __iter__(self):
+        return iter(self._index)
+
+    def __len__(self):
+        return len(self._index)
+
+
+class _LazyLayerDict(dict):
+    """Looks like a dict[layer_idx] → LayerWeightSet, loads from StreamingWeights on access."""
+    def __init__(self, sw: 'StreamingWeights'):
+        super().__init__()
+        self._sw = sw
+
+    def __getitem__(self, idx):
+        # Check dict storage directly (bypass overridden __contains__)
+        if not dict.__contains__(self, idx):
+            lw = self._sw.get_layer(idx)
+            dict.__setitem__(self, idx, lw)
+        return dict.__getitem__(self, idx)
+
+    def __contains__(self, idx):
+        return dict.__contains__(self, idx)
+
+    def __len__(self):
+        return self._sw.num_layers
+
+    def keys(self):
+        return range(self._sw.num_layers)
+
+    def items(self):
+        for i in range(self._sw.num_layers):
+            yield i, self[i]
+
+    def values(self):
+        for i in range(self._sw.num_layers):
+            yield self[i]
+
+    def get(self, idx, default=None):
+        try:
+            # dict.get() uses our __getitem__ which does lazy loading
+            return self[idx]
+        except (KeyError, IndexError, TypeError):
+            return default
+
+
+class _FullWeightsProxy:
+    """Drop-in replacement for FullWeights that streams from StreamingWeights on demand.
+
+    Exposes the same attributes that `_layer_weights_for_node` and WeightProvider
+    access.  Layer weights are loaded one-at-a-time from mmap; embedding/lm_head
+    are loaded lazily on first access.
+    """
+    def __init__(self, sw: 'StreamingWeights'):
+        self._sw = sw
+        self.num_layers = sw.num_layers
+        self.hidden_dim = sw.hidden_dim
+        self.n_heads = sw.n_heads
+        self.n_kv_heads = sw.n_kv_heads
+        self.head_dim = sw.default_head_dim
+        self.ffn_dim = sw.ffn_dim
+        self.vocab_size = sw.vocab_size
+        self.model_type = getattr(sw.cfg, "model_type", "llama")
+        self.layer_props = {i: sw.get_layer_props(i) for i in range(sw.num_layers)}
+        self._lazy_layers = _LazyLayerDict(sw)
+        self._embedding: Optional[np.ndarray] = None
+        self._lm_head: Optional[np.ndarray] = None
+        self._final_norm: Optional[np.ndarray] = None
+        self.ple_embedding: Optional[np.ndarray] = None
+        self.ple_projection: Optional[np.ndarray] = None
+        self.ple_projection_norm: Optional[np.ndarray] = None
+        self.ple_dim: int = 0
+        self.ple_vocab_size: int = 0
+
+    @property
+    def layer_weights(self) -> _LazyLayerDict:
+        return self._lazy_layers
+
+    @property
+    def embedding(self) -> np.ndarray:
+        if self._embedding is None:
+            self._embedding = self._sw.get_embedding()
+        return self._embedding
+
+    @property
+    def lm_head(self) -> np.ndarray:
+        if self._lm_head is None:
+            self._lm_head = self._sw.get_lm_head()
+        return self._lm_head
+
+    @property
+    def final_norm(self) -> Optional[np.ndarray]:
+        if self._final_norm is None:
+            self._final_norm = self._sw.get_final_norm()
+        return self._final_norm
+
+
+class StreamingWeights:
+    """Memory-mapped safetensors reader.
+
+    Opens safetensors files via mmap and provides per-layer access so the
+    caller never holds the full model's weights in RAM at once.  Works with
+    single-shard and multi-shard HuggingFace caches.
+    """
+
+    def __init__(self, model_id: str, num_layers: Optional[int] = None):
+        import json
+        import mmap
+        import os
+        import struct
+
+        from transformers import AutoConfig
+
+        self.model_id = model_id
+        self.cfg = AutoConfig.from_pretrained(model_id)
+
+        # Resolve safetensors file paths and memory-map them
+        self._tensor_index: Dict[str, dict] = {}
+        self._mmaps: list = []
+        self._resolve_and_mmap()
+
+        # Infer naming convention from tensor names/shapes (never loads data)
+        mock_state = _ShapeState(self._tensor_index)
+        model_type = getattr(self.cfg, "model_type", "llama")
+        self._key_info = _infer_weight_keys(mock_state, model_type=model_type, cfg=self.cfg)
+
+        # Extract dimensions from config
+        self.hidden_dim = getattr(self.cfg, "hidden_size", None)
+        self.n_heads = getattr(self.cfg, "num_attention_heads", None)
+        self.n_kv_heads = getattr(self.cfg, "num_key_value_heads", self.n_heads)
+        self.default_head_dim = getattr(self.cfg, "head_dim", None) or (
+            self.hidden_dim // self.n_heads if self.n_heads else None
+        )
+        self.ffn_dim = getattr(self.cfg, "intermediate_size", None)
+        self.vocab_size = getattr(self.cfg, "vocab_size", None)
+        self.num_layers = num_layers or getattr(
+            self.cfg, "num_hidden_layers",
+            getattr(self.cfg, "num_layers", None),
+        )
+
+        # Build per-layer property info
+        self._layer_props: Dict[int, LayerProperties] = {}
+        ki = self._key_info.get("per_layer", {})
+        for lidx in range(self.num_layers):
+            pl = ki.get(lidx, {})
+            if model_type == "gemma4":
+                if not pl.get("has_v_proj", True):
+                    hd = pl.get("head_dim", self.default_head_dim * 2)
+                    self._layer_props[lidx] = LayerProperties.gemma4_global(hd)
+                else:
+                    hd = pl.get("head_dim", self.default_head_dim)
+                    self._layer_props[lidx] = LayerProperties.gemma4_sliding(hd)
+            else:
+                self._layer_props[lidx] = LayerProperties.standard(self.default_head_dim)
+
+    def _resolve_and_mmap(self):
+        import json
+        import mmap
+        import os
+        import struct
+
+        from transformers.utils.hub import cached_file
+
+        # Try multi-shard index first
+        index_path = cached_file(
+            self.model_id, "model.safetensors.index.json",
+            _raise_exceptions_for_missing_entries=False,
+        )
+        shard_paths = {}
+        if index_path:
+            with open(index_path) as f:
+                index = json.load(f)
+            for shard in set(index["weight_map"].values()):
+                shard_paths[shard] = cached_file(self.model_id, shard)
+        else:
+            # Single file
+            single_path = cached_file(
+                self.model_id, "model.safetensors",
+                _raise_exceptions_for_missing_entries=False,
+            )
+            if single_path:
+                shard_paths["model.safetensors"] = single_path
+            else:
+                raise FileNotFoundError(
+                    f"No safetensors files found for {self.model_id} in HF cache. "
+                    "Use from_pretrained() first or set HF_TOKEN for gated models."
+                )
+
+        for shard_name, filepath in shard_paths.items():
+            with open(filepath, 'rb') as f:
+                header_len = struct.unpack('<Q', f.read(8))[0]
+                header = json.loads(f.read(header_len))
+            fd = os.open(filepath, os.O_RDONLY)
+            mm = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+            os.close(fd)
+            self._mmaps.append(mm)
+            data_start = 8 + header_len
+            for name, info in header.items():
+                if name.startswith('__') or not isinstance(info, dict):
+                    continue  # skip metadata entries
+                start = data_start + info['data_offsets'][0]
+                self._tensor_index[name] = {
+                    'mmap': mm,
+                    'offset': start,
+                    'shape': tuple(info['shape']),
+                    'dtype': info['dtype'],
+                    'numel': int(np.prod(info['shape'])),
+                }
+
+    def _read_tensor(self, name: str) -> torch.Tensor:
+        """Read a single tensor from mmap, return as torch bfloat16."""
+        info = self._tensor_index[name]
+        mm = info['mmap']
+        dtype_str = info['dtype']
+        shape = info['shape']
+        numel = info['numel']
+        elem_size = _DTYPE_SIZE.get(dtype_str, 4)
+        num_bytes = numel * elem_size
+        buf = memoryview(mm)[info['offset']:info['offset'] + num_bytes]
+        if dtype_str == 'BF16':
+            arr = np.frombuffer(buf, dtype=np.uint16).reshape(shape)
+            return torch.from_numpy(arr.copy()).view(torch.bfloat16)
+        elif dtype_str == 'F32':
+            arr = np.frombuffer(buf, dtype=np.float32).reshape(shape)
+            return torch.from_numpy(arr.copy())
+        elif dtype_str == 'F16':
+            arr = np.frombuffer(buf, dtype=np.float16).reshape(shape)
+            return torch.from_numpy(arr.copy())
+        else:
+            np_dtype = getattr(np, dtype_str.lower(), None) or np.float32
+            arr = np.frombuffer(buf, dtype=np_dtype).reshape(shape)
+            return torch.from_numpy(arr.copy())
+
+    def _read_numpy(self, name: str) -> np.ndarray:
+        """Read a single tensor from mmap, return as float32 numpy array."""
+        info = self._tensor_index[name]
+        mm = info['mmap']
+        dtype_str = info['dtype']
+        shape = info['shape']
+        numel = info['numel']
+        elem_size = _DTYPE_SIZE.get(dtype_str, 4)
+        num_bytes = numel * elem_size
+        buf = memoryview(mm)[info['offset']:info['offset'] + num_bytes]
+        if dtype_str == 'F32':
+            return np.frombuffer(buf, dtype=np.float32).reshape(shape).copy()
+        elif dtype_str == 'F16':
+            return np.frombuffer(buf, dtype=np.float16).reshape(shape).copy().astype(np.float32)
+        elif dtype_str == 'BF16':
+            arr = np.frombuffer(buf, dtype=np.uint16).reshape(shape).copy()
+            t = torch.from_numpy(arr).view(torch.bfloat16)
+            return t.to(torch.float32).cpu().numpy()
+        else:
+            np_dtype = getattr(np, dtype_str.lower(), None) or np.float32
+            return np.frombuffer(buf, dtype=np_dtype).reshape(shape).copy()
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        return self._read_tensor(name)
+
+    def get_layer(self, idx: int) -> LayerWeightSet:
+        ki = self._key_info
+        tmpl = ki["attn_tmpl"]
+
+        q_raw = self._read_tensor(tmpl.format(idx, "q"))
+        k_raw = self._read_tensor(tmpl.format(idx, "k"))
+        has_v = ki["per_layer"].get(idx, {}).get("has_v_proj", True)
+        v_raw = self._read_tensor(tmpl.format(idx, "v")) if has_v else None
+        o_raw = self._read_tensor(tmpl.format(idx, "o"))
+
+        mlp_tmpl = ki["mlp_tmpl"]
+        if ki["ffn_gated"]:
+            gate_raw = self._read_tensor(mlp_tmpl.format(idx, "gate"))
+            up_raw = self._read_tensor(mlp_tmpl.format(idx, "up"))
+            down_raw = self._read_tensor(mlp_tmpl.format(idx, "down"))
+        else:
+            fc1 = self._read_tensor(mlp_tmpl.format(idx, "1"))
+            fc2 = self._read_tensor(mlp_tmpl.format(idx, "2"))
+            gate_raw = fc1
+            up_raw = fc1
+            down_raw = fc2
+
+        q = _torch_to_b16(q_raw, transpose=True)
+        k = _torch_to_b16(k_raw, transpose=True)
+        v = _torch_to_b16(v_raw, transpose=True) if v_raw is not None else None
+        o = _torch_to_b16(o_raw, transpose=True)
+        gate = _torch_to_b16(gate_raw, transpose=True)
+        up = _torch_to_b16(up_raw, transpose=True)
+        down = _torch_to_b16(down_raw, transpose=True)
+
+        q_bias = k_bias = v_bias = None
+        if ki.get("has_qkv_bias"):
+            bias_tmpl = tmpl.replace(".weight", ".bias")
+            q_bias = self._read_numpy(bias_tmpl.format(idx, "q"))
+            k_bias = self._read_numpy(bias_tmpl.format(idx, "k"))
+            v_bias = self._read_numpy(bias_tmpl.format(idx, "v"))
+
+        input_norm = post_attn_norm = None
+        input_norm_tmpl = ki.get("input_norm_tmpl")
+        if input_norm_tmpl and input_norm_tmpl.format(idx) in self._tensor_index:
+            input_norm_raw = self._read_tensor(input_norm_tmpl.format(idx))
+            input_norm = input_norm_raw.to(torch.float32).cpu().numpy()
+        post_attn_norm_tmpl = ki.get("post_attn_norm_tmpl")
+        if post_attn_norm_tmpl and post_attn_norm_tmpl.format(idx) in self._tensor_index:
+            post_attn_norm_raw = self._read_tensor(post_attn_norm_tmpl.format(idx))
+            post_attn_norm = post_attn_norm_raw.to(torch.float32).cpu().numpy()
+
+        return LayerWeightSet(
+            q=q, k=k, v=v, o=o,
+            ffn_gate=gate, ffn_up=up, ffn_down=down,
+            q_bias=q_bias, k_bias=k_bias, v_bias=v_bias,
+            input_layernorm=input_norm,
+            post_attention_layernorm=post_attn_norm,
+            has_v_proj=has_v,
+            props=self._layer_props.get(idx),
+        )
+
+    def get_embedding(self) -> np.ndarray:
+        return self._read_numpy(self._key_info["embed_key"])
+
+    def get_lm_head(self) -> np.ndarray:
+        ekey = self._key_info["embed_key"]
+        lkey = self._key_info["lm_head_key"]
+        if lkey == ekey:
+            return self._read_numpy(ekey)
+        return self._read_numpy(lkey)
+
+    def get_final_norm(self) -> Optional[np.ndarray]:
+        nk = self._key_info.get("norm_key")
+        if nk and nk in self._tensor_index:
+            return self._read_numpy(nk)
+        return None
+
+    def get_layer_props(self, idx: int) -> LayerProperties:
+        return self._layer_props.get(idx, LayerProperties.standard(self.default_head_dim))
+
+    def get_unique_layer_types(self) -> Dict[tuple, int]:
+        types = {}
+        for i in range(self.num_layers):
+            p = self._layer_props[i]
+            key = (p.head_dim, p.attention_type, p.rope_fraction, p.use_v_norm)
+            if key not in types:
+                types[key] = i
+        return types
+
+    def close(self):
+        for mm in self._mmaps:
+            try:
+                mm.close()
+            except Exception:
+                pass
+        self._mmaps.clear()
+        self._tensor_index.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
 class WeightProvider:
-    """Provides sliced weights for each node and layer."""
+    """Provides sliced weights for each node and layer.
+
+    Uses memory-mapped safetensors (StreamingWeights) so the full model is
+    never loaded into RAM.  Layers are loaded one at a time during slicing.
+    """
 
     def __init__(self, model_id: str, partitions: Dict[int, dict], num_layers: int = 0,
                  use_cache: bool = True):
         self.model_id = model_id
         self.partitions = partitions
         self.use_cache = use_cache
-        self.full = _load_full_weights(model_id, num_layers if num_layers > 0 else None,
-                                       use_cache=use_cache)
+        self._streaming = StreamingWeights(model_id, num_layers=num_layers if num_layers > 0 else None)
+        self.full = _FullWeightsProxy(self._streaming)
         self._layer_props = self.full.layer_props
 
     def get_layer_props(self, layer_idx: int) -> LayerProperties:
