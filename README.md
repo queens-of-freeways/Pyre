@@ -21,7 +21,8 @@ pyre ps
 ## Install
 
 ### Prerequisites
-- Linux x86-64
+- Linux x86-64 (root node with Mojo/MAX requires this)
+- Linux aarch64 (workers only — Python-only, no Mojo/MAX needed)
 - [pixi](https://pixi.sh) (package manager)
 
 ### Setup
