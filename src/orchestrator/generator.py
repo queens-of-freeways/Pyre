@@ -156,6 +156,7 @@ def _build_gen(
     model: str = "HuggingFaceTB/SmolLM-135M",
     num_layers: int = 0,
     real_weights: bool = False,
+    reload: bool = False,
 ) -> Generator:
     from transformers import AutoTokenizer
 
@@ -182,7 +183,7 @@ def _build_gen(
             "seq_end": seq_end,
         }
 
-    wp = WeightProvider(model, partitions, num_layers=num_layers)
+    wp = WeightProvider(model, partitions, num_layers=num_layers, use_cache=not reload)
 
     # Build only root weights (views, no copies). Workers get weights on-demand via weight_provider.
     root_weights = {0: wp.get_root_weights(0)}

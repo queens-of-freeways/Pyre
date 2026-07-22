@@ -29,8 +29,10 @@ def main():
               help="Sampling temperature (0 = greedy, 0.7 = default)")
 @click.option("--chat", is_flag=True, default=False,
               help="Chat mode — generate until EOS, no need for --max-tokens")
+@click.option("--reload", is_flag=True, default=False,
+              help="Force re-download model from HuggingFace, bypassing cache")
 def run(model, workers, prompt, max_tokens, layers,
-        discover_timeout, expect_workers, no_local, temperature, chat):
+        discover_timeout, expect_workers, no_local, temperature, chat, reload):
     """Run distributed generation (auto-starts a local worker)."""
     exit(run_generation(
         model=model,
@@ -40,6 +42,7 @@ def run(model, workers, prompt, max_tokens, layers,
         layers=layers,
         temperature=temperature,
         chat=chat,
+        reload=reload,
         discover_timeout=discover_timeout,
         expect_workers=expect_workers,
         no_local=no_local,

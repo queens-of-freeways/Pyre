@@ -52,6 +52,7 @@ Starts a local worker by default (the root machine also contributes compute).
 | `--no-local` | false | Skip local worker (root only orchestrates) |
 | `--discover-timeout` | 3.0 | Seconds to wait for mDNS discovery |
 | `--expect-workers` | — | Return as soon as N workers found |
+| `--reload` | false | Force re-download model from HuggingFace, bypassing disk cache |
 
 ```bash
 # Local only
@@ -97,6 +98,15 @@ Models like Gemma 4, Llama 3, and Mistral require authentication:
 ```bash
 huggingface-cli login
 ```
+
+## Weight Cache
+
+Model weights are cached to disk after the first load to accelerate subsequent runs:
+
+- **Full weights** (`~/.cache/pyre/full/`) — The complete model is saved after loading from HuggingFace. Subsequent runs skip `from_pretrained()` and load directly from cache.
+- **Sliced weights** (`~/.cache/pyre/sliced/`) — Per-node weight slices are cached after the first partition computation. Subsequent runs skip the torch→float32 conversion and slicing overhead.
+
+Clear a model's cache with `pyre run --reload` to force re-downloading from HuggingFace.
 
 ## Architecture
 

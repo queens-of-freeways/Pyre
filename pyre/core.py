@@ -16,6 +16,7 @@ def run_generation(
     layers=0,
     temperature=0.7,
     chat=False,
+    reload=False,
     discover_timeout=3.0,
     expect_workers=None,
     local_worker=True,
@@ -59,7 +60,7 @@ def run_generation(
         print("ERROR: No workers available. Start workers or use --workers.")
         return 1
 
-    gen = _build_gen(worker_addrs, model=model, num_layers=layers)
+    gen = _build_gen(worker_addrs, model=model, num_layers=layers, reload=reload)
 
     try:
         gen.generate(prompt, max_tokens=(None if chat else max_tokens), stream=True, temperature=temperature)

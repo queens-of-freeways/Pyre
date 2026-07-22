@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -92,11 +95,260 @@ def _torch_to_b16(t: torch.Tensor, transpose: bool = False) -> torch.Tensor:
     return t.contiguous()
 
 def _ensure_f32(arr: np.ndarray) -> np.ndarray:
-    """Ensure array is float32. No-op if already float32."""
     if arr.dtype != np.float32:
         return arr.astype(np.float32, copy=False)
     return arr
 
+
+# ── Weight cache helpers (Phases 1 & 2) ──────────────────────────────
+
+def _get_cache_root() -> str:
+    return os.path.join(os.path.expanduser("~"), ".cache", "pyre")
+
+def _model_slug(model_id: str) -> str:
+    return model_id.replace("/", "_").replace("-", "_").replace(".", "_")
+
+def _full_weights_cache_path(model_id: str, num_layers: int) -> str:
+    slug = _model_slug(model_id)
+    key = num_layers if num_layers > 0 else 0
+    return os.path.join(_get_cache_root(), "full", slug, f"weights_l{key}.pt")
+
+def _full_weights_cache_meta_path(model_id: str, num_layers: int) -> str:
+    slug = _model_slug(model_id)
+    key = num_layers if num_layers > 0 else 0
+    return os.path.join(_get_cache_root(), "full", slug, f"meta_l{key}.json")
+
+def _np_to_tensor(arr):
+    if isinstance(arr, np.ndarray):
+        return torch.from_numpy(arr)
+    return arr
+
+def _tensor_to_np(t):
+    if isinstance(t, torch.Tensor):
+        return t.cpu().numpy()
+    return t
+
+def _full_weights_to_cache(weights: FullWeights) -> tuple[dict, dict]:
+    tensors = {}
+    tensors["embedding"] = _np_to_tensor(weights.embedding)
+    tensors["lm_head"] = _np_to_tensor(weights.lm_head)
+    if weights.final_norm is not None:
+        tensors["final_norm"] = _np_to_tensor(weights.final_norm)
+    if weights.ple_embedding is not None:
+        tensors["ple_embedding"] = _np_to_tensor(weights.ple_embedding)
+    if weights.ple_projection is not None:
+        tensors["ple_projection"] = _np_to_tensor(weights.ple_projection)
+    if weights.ple_projection_norm is not None:
+        tensors["ple_projection_norm"] = _np_to_tensor(weights.ple_projection_norm)
+
+    for lidx in range(weights.num_layers):
+        lw = weights.layer_weights[lidx]
+        pfx = f"layer_{lidx}"
+        tensors[f"{pfx}.q"] = lw.q
+        tensors[f"{pfx}.k"] = lw.k
+        tensors[f"{pfx}.ffn_gate"] = lw.ffn_gate
+        tensors[f"{pfx}.ffn_up"] = lw.ffn_up
+        tensors[f"{pfx}.ffn_down"] = lw.ffn_down
+        if lw.v is not None:
+            tensors[f"{pfx}.v"] = lw.v
+        if lw.o is not None:
+            tensors[f"{pfx}.o"] = lw.o
+        if lw.q_bias is not None:
+            tensors[f"{pfx}.q_bias"] = _np_to_tensor(lw.q_bias)
+        if lw.k_bias is not None:
+            tensors[f"{pfx}.k_bias"] = _np_to_tensor(lw.k_bias)
+        if lw.v_bias is not None:
+            tensors[f"{pfx}.v_bias"] = _np_to_tensor(lw.v_bias)
+        if lw.input_layernorm is not None:
+            tensors[f"{pfx}.input_layernorm"] = _np_to_tensor(lw.input_layernorm)
+        if lw.post_attention_layernorm is not None:
+            tensors[f"{pfx}.post_attention_layernorm"] = _np_to_tensor(lw.post_attention_layernorm)
+        if lw.ple_gate is not None:
+            tensors[f"{pfx}.ple_gate"] = _np_to_tensor(lw.ple_gate)
+        if lw.ple_proj is not None:
+            tensors[f"{pfx}.ple_proj"] = _np_to_tensor(lw.ple_proj)
+        if lw.ple_post_norm is not None:
+            tensors[f"{pfx}.ple_post_norm"] = _np_to_tensor(lw.ple_post_norm)
+
+    meta = {
+        "num_layers": weights.num_layers,
+        "hidden_dim": weights.hidden_dim,
+        "n_heads": weights.n_heads,
+        "n_kv_heads": weights.n_kv_heads,
+        "head_dim": weights.head_dim,
+        "ffn_dim": weights.ffn_dim,
+        "vocab_size": weights.vocab_size,
+        "model_type": weights.model_type,
+        "ple_dim": weights.ple_dim,
+        "ple_vocab_size": weights.ple_vocab_size,
+        "layer_props": {},
+        "layer_has_v": {},
+        "layer_kv_source": {},
+    }
+    for lidx in range(weights.num_layers):
+        props = weights.layer_props[lidx]
+        meta["layer_props"][lidx] = {
+            "head_dim": props.head_dim,
+            "has_v_proj": props.has_v_proj,
+            "rope_fraction": props.rope_fraction,
+            "use_v_norm": props.use_v_norm,
+            "attention_type": props.attention_type,
+            "kv_source_layer": props.kv_source_layer,
+        }
+        meta["layer_has_v"][lidx] = weights.layer_weights[lidx].has_v_proj
+        meta["layer_kv_source"][lidx] = (
+            weights.layer_weights[lidx].props.kv_source_layer
+            if weights.layer_weights[lidx].props else None
+        )
+    return meta, tensors
+
+def _full_weights_from_cache(meta: dict, tensors: dict) -> FullWeights:
+    n_layers = meta["num_layers"]
+    layer_weights = {}
+    layer_props = {}
+    for lidx in range(n_layers):
+        pfx = f"layer_{lidx}"
+        pm = meta["layer_props"][lidx]
+        props = LayerProperties(
+            head_dim=pm["head_dim"],
+            has_v_proj=pm["has_v_proj"],
+            rope_fraction=pm["rope_fraction"],
+            use_v_norm=pm["use_v_norm"],
+            attention_type=pm["attention_type"],
+            kv_source_layer=pm["kv_source_layer"],
+        )
+        lw = LayerWeightSet(
+            q=tensors[f"{pfx}.q"],
+            k=tensors[f"{pfx}.k"],
+            ffn_gate=tensors[f"{pfx}.ffn_gate"],
+            ffn_up=tensors[f"{pfx}.ffn_up"],
+            ffn_down=tensors[f"{pfx}.ffn_down"],
+            v=tensors.get(f"{pfx}.v"),
+            o=tensors.get(f"{pfx}.o"),
+            q_bias=_tensor_to_np(tensors.get(f"{pfx}.q_bias")),
+            k_bias=_tensor_to_np(tensors.get(f"{pfx}.k_bias")),
+            v_bias=_tensor_to_np(tensors.get(f"{pfx}.v_bias")),
+            input_layernorm=_tensor_to_np(tensors.get(f"{pfx}.input_layernorm")),
+            post_attention_layernorm=_tensor_to_np(tensors.get(f"{pfx}.post_attention_layernorm")),
+            has_v_proj=meta["layer_has_v"][lidx],
+            props=props,
+            ple_gate=_tensor_to_np(tensors.get(f"{pfx}.ple_gate")),
+            ple_proj=_tensor_to_np(tensors.get(f"{pfx}.ple_proj")),
+            ple_post_norm=_tensor_to_np(tensors.get(f"{pfx}.ple_post_norm")),
+        )
+        layer_weights[lidx] = lw
+        layer_props[lidx] = props
+
+    return FullWeights(
+        layer_weights=layer_weights,
+        layer_props=layer_props,
+        embedding=_tensor_to_np(tensors["embedding"]),
+        lm_head=_tensor_to_np(tensors["lm_head"]),
+        final_norm=_tensor_to_np(tensors.get("final_norm")),
+        num_layers=n_layers,
+        hidden_dim=meta["hidden_dim"],
+        n_heads=meta["n_heads"],
+        n_kv_heads=meta["n_kv_heads"],
+        head_dim=meta["head_dim"],
+        ffn_dim=meta["ffn_dim"],
+        vocab_size=meta["vocab_size"],
+        model_type=meta["model_type"],
+        ple_embedding=_tensor_to_np(tensors.get("ple_embedding")),
+        ple_projection=_tensor_to_np(tensors.get("ple_projection")),
+        ple_projection_norm=_tensor_to_np(tensors.get("ple_projection_norm")),
+        ple_dim=meta["ple_dim"],
+        ple_vocab_size=meta["ple_vocab_size"],
+    )
+
+def _save_full_weights_cache(weights: FullWeights, model_id: str, num_layers: int) -> str:
+    path = _full_weights_cache_path(model_id, num_layers)
+    meta_path = _full_weights_cache_meta_path(model_id, num_layers)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    meta, tensors = _full_weights_to_cache(weights)
+    torch.save(tensors, path)
+    with open(meta_path, "w") as f:
+        json.dump(meta, f)
+    return path
+
+def _load_full_weights_from_cache(model_id: str, num_layers: int) -> Optional[FullWeights]:
+    path = _full_weights_cache_path(model_id, num_layers)
+    meta_path = _full_weights_cache_meta_path(model_id, num_layers)
+    if not os.path.exists(path) or not os.path.exists(meta_path):
+        return None
+    try:
+        tensors = torch.load(path, weights_only=False)
+        with open(meta_path) as f:
+            meta = json.load(f)
+        # Restore integer keys (JSON serializes dict keys as strings)
+        meta["layer_props"] = {int(k): v for k, v in meta["layer_props"].items()}
+        meta["layer_has_v"] = {int(k): v for k, v in meta["layer_has_v"].items()}
+        meta["layer_kv_source"] = {int(k): v for k, v in meta["layer_kv_source"].items()}
+        return _full_weights_from_cache(meta, tensors)
+    except Exception:
+        return None
+
+# ── Sliced weight cache (Phase 2) ────────────────────────────────────
+
+def _partition_hash(partitions: Dict[int, dict]) -> str:
+    h = hashlib.md5()
+    for nid in sorted(partitions.keys()):
+        p = partitions[nid]
+        h.update(f"{nid}:{p['ffn_start']}:{p['ffn_end']}:{p['seq_start']}:{p['seq_end']}".encode())
+    return h.hexdigest()[:16]
+
+def _sliced_cache_path(model_id: str, partitions: Dict[int, dict], node_id: int) -> str:
+    slug = _model_slug(model_id)
+    phash = _partition_hash(partitions)
+    return os.path.join(_get_cache_root(), "sliced", slug, phash, f"node_{node_id}.pt")
+
+def _flatten_sliced(weights: Dict[int, dict]) -> dict:
+    flat = {}
+    def _walk(obj, prefix: str):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                _walk(v, f"{prefix}.{k}" if prefix else k)
+        elif isinstance(obj, np.ndarray):
+            flat[prefix] = torch.from_numpy(np.ascontiguousarray(obj))
+        elif isinstance(obj, (np.integer,)):
+            flat[prefix] = int(obj)
+        elif isinstance(obj, (np.floating,)):
+            flat[prefix] = float(obj)
+        else:
+            flat[prefix] = obj
+    for lidx, lw in sorted(weights.items()):
+        _walk(lw, str(lidx))
+    return flat
+
+def _unflatten_sliced(flat: dict) -> Dict[int, dict]:
+    result = {}
+    for key, value in flat.items():
+        parts = key.split(".")
+        lidx = int(parts[0])
+        d = result.setdefault(lidx, {})
+        for p in parts[1:-1]:
+            d = d.setdefault(p, {})
+        last = parts[-1]
+        if isinstance(value, torch.Tensor):
+            d[last] = np.ascontiguousarray(value.cpu().numpy())
+        else:
+            d[last] = value
+    return result
+
+def _save_sliced_weights(path: str, weights: Dict[int, dict]):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    flat = _flatten_sliced(weights)
+    torch.save(flat, path)
+
+def _load_sliced_weights(path: str) -> Optional[Dict[int, dict]]:
+    if not os.path.exists(path):
+        return None
+    try:
+        flat = torch.load(path, weights_only=False)
+        return _unflatten_sliced(flat)
+    except Exception:
+        return None
+
+# ── end cache helpers ────────────────────────────────────────────────
 
 def _infer_weight_keys(state: Dict[str, torch.Tensor], model_type: str = "llama",
                         cfg: Any = None) -> dict:
@@ -272,7 +524,17 @@ def _load_layer_weights(
                           ple_gate=ple_gate, ple_proj=ple_proj, ple_post_norm=ple_post_norm)
 
 
-def _load_full_weights(model_id: str, num_layers: Optional[int] = None) -> FullWeights:
+def _load_full_weights(model_id: str, num_layers: Optional[int] = None,
+                       use_cache: bool = True) -> FullWeights:
+    if use_cache:
+        from transformers import AutoConfig
+        cfg_tmp = AutoConfig.from_pretrained(model_id)
+        n_tmp = num_layers or getattr(cfg_tmp, "num_hidden_layers",
+                                      getattr(cfg_tmp, "num_layers", 0))
+        cached = _load_full_weights_from_cache(model_id, n_tmp)
+        if cached is not None:
+            return cached
+
     from transformers import AutoConfig, AutoModelForCausalLM
     cfg = AutoConfig.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
@@ -370,7 +632,7 @@ def _load_full_weights(model_id: str, num_layers: Optional[int] = None) -> FullW
 
     del state
 
-    return FullWeights(
+    fw = FullWeights(
         layer_weights=layer_weights,
         layer_props=layer_props,
         embedding=embedding,
@@ -390,6 +652,9 @@ def _load_full_weights(model_id: str, num_layers: Optional[int] = None) -> FullW
         ple_dim=ple_dim_val,
         ple_vocab_size=ple_vocab_size_val,
     )
+    if use_cache:
+        _save_full_weights_cache(fw, model_id, n_layers)
+    return fw
 
 
 def _slice_attn_for_node(
@@ -450,10 +715,13 @@ def _slice_ffn_for_node(full: FullWeights, layer_idx: int, ffn_start: int, ffn_e
 class WeightProvider:
     """Provides sliced weights for each node and layer."""
 
-    def __init__(self, model_id: str, partitions: Dict[int, dict], num_layers: int = 0):
+    def __init__(self, model_id: str, partitions: Dict[int, dict], num_layers: int = 0,
+                 use_cache: bool = True):
         self.model_id = model_id
         self.partitions = partitions
-        self.full = _load_full_weights(model_id, num_layers if num_layers > 0 else None)
+        self.use_cache = use_cache
+        self.full = _load_full_weights(model_id, num_layers if num_layers > 0 else None,
+                                       use_cache=use_cache)
         self._layer_props = self.full.layer_props
 
     def get_layer_props(self, layer_idx: int) -> LayerProperties:
@@ -569,19 +837,31 @@ class WeightProvider:
         return result
 
     def get_node_weights(self, node_id: int, num_nodes: int) -> Dict[int, dict]:
-        """Returns {layer_idx: {attn: ..., ffn: ...}} for a worker node (full Q, with copies)."""
+        if self.use_cache:
+            path = _sliced_cache_path(self.model_id, self.partitions, node_id)
+            cached = _load_sliced_weights(path)
+            if cached is not None:
+                return cached
         p = self.partitions[node_id]
         node_layers = {}
         for layer_idx in range(self.full.num_layers):
             node_layers[layer_idx] = self._layer_weights_for_node(layer_idx, p, full_q=True, copy_weights=True)
+        if self.use_cache:
+            _save_sliced_weights(path, node_layers)
         return node_layers
 
     def get_root_weights(self, node_id: int) -> Dict[int, dict]:
-        """Returns {layer_idx: {attn: ..., ffn: ...}} for the root node. Uses safe copies."""
+        if self.use_cache:
+            path = _sliced_cache_path(self.model_id, self.partitions, node_id)
+            cached = _load_sliced_weights(path)
+            if cached is not None:
+                return cached
         p = self.partitions[node_id]
         node_layers = {}
         for layer_idx in range(self.full.num_layers):
             node_layers[layer_idx] = self._layer_weights_for_node(layer_idx, p, full_q=True, copy_weights=True)
+        if self.use_cache:
+            _save_sliced_weights(path, node_layers)
         return node_layers
 
     def get_embedding(self) -> np.ndarray:
