@@ -45,6 +45,8 @@ class WorkerNode:
         self.config = None
         self.local_seq_len = None
         self.hidden_dim = None
+        self._compressed = {}
+        self._dequantized = {}
         self.layer_weights = {}
         self.layer_graph_key = {}
         self.layer_props = {}
@@ -75,6 +77,24 @@ class WorkerNode:
         }
         self._fallback_cache[layer_idx] = fw
         return fw
+
+    def _get_dequantized(self, lidx: int) -> dict:
+        """Get dequantized weights for a layer, loading from compressed cache."""
+        if lidx in self._dequantized:
+            return self._dequantized[lidx]
+        if lidx in self._compressed:
+            lw = self._compressed[lidx]
+            if isinstance(lw, dict) and any(
+                isinstance(v, tuple) and v[0] == "q8"
+                for v in lw.values() if isinstance(v, tuple)
+            ):
+                lw = dequantize_weights_dict(lw)
+            self._dequantized[lidx] = lw
+            return lw
+        return self._get_fallback_weights(lidx)
+
+    def _free_dequantized(self, lidx: int):
+        self._dequantized.pop(lidx, None)
 
     def _compile_attention(self, head_dim: int):
         if self.shard is None:
@@ -134,7 +154,10 @@ class WorkerNode:
             send_msg(conn, MSG_READY)
 
             # Receive layers one at a time via MSG_LAYER_WEIGHTS (streaming)
-            self.layer_weights = {}
+            # Store compressed (Q8_0) payload; dequantize per-layer on first use.
+            self._compressed = {}
+            self._dequantized = {}
+            self.layer_weights = {}  # backward-compat alias — kept as live ref
             self.layer_props = {}
             num_layers = self.config.num_layers
             for layer_idx in range(num_layers):
@@ -146,7 +169,8 @@ class WorkerNode:
                     layer_payload = payload
                     if isinstance(layer_payload, dict):
                         layer_payload = dequantize_weights_dict(layer_payload)
-                    self.layer_weights = layer_payload.get("weights", {})
+                    for w_lidx, w_payload in layer_payload.get("weights", {}).items():
+                        self._compressed[w_lidx] = w_payload
                     self.layer_props = layer_payload.get("props", {})
                     break
                 else:
@@ -155,10 +179,7 @@ class WorkerNode:
                         f"or INIT_WEIGHTS ({MSG_INIT_WEIGHTS}), got {msg_type}"
                     )
 
-                if isinstance(layer_payload, dict):
-                    layer_payload = dequantize_weights_dict(layer_payload)
-
-                self.layer_weights[lidx] = layer_payload
+                self._compressed[lidx] = layer_payload
                 self.layer_props[lidx] = layer_payload.get("_props", {})
 
             needed_hds = set()
@@ -176,10 +197,7 @@ class WorkerNode:
                     break
                 if msg_type == MSG_FORWARD_DATA:
                     layer_idx, x_slice = data
-                    lw = self.layer_weights.get(layer_idx) if self.layer_weights else None
-                    if lw is None:
-                        lw = self._get_fallback_weights(layer_idx)
-
+                    lw = self._get_dequantized(layer_idx)
                     lp = self.layer_props.get(layer_idx, {})
                     hd = lp.get("head_dim", self.config.head_dim)
                     aw = lw["attn"]
@@ -206,6 +224,7 @@ class WorkerNode:
                         conn, MSG_FORWARD_RESULT,
                         (q.to_numpy(), k.to_numpy(), v.to_numpy()),
                     )
+                    self._free_dequantized(layer_idx)
                 elif msg_type == MSG_ATTN_OUTPUT:
                     (h_norm_full,) = data
                     (partial,) = self.ffn_model.execute(
@@ -214,12 +233,13 @@ class WorkerNode:
                         np.ascontiguousarray(self._current_ffn_up),
                         np.ascontiguousarray(self._current_ffn_down),
                     )
+                    self._current_ffn_gate = None
+                    self._current_ffn_up = None
+                    self._current_ffn_down = None
                     send_msg(conn, MSG_FFN_RESULT, partial.to_numpy())
                 elif msg_type == MSG_DECODE_STEP:
                     layer_idx, h_norm = data
-                    lw = self.layer_weights.get(layer_idx) if self.layer_weights else None
-                    if lw is None:
-                        lw = self._get_fallback_weights(layer_idx)
+                    lw = self._get_dequantized(layer_idx)
                     fw = lw["ffn"]
                     (partial,) = self.ffn_decode_model.execute(
                         np.ascontiguousarray(h_norm),
@@ -228,6 +248,7 @@ class WorkerNode:
                         np.ascontiguousarray(fw["down"]),
                     )
                     send_msg(conn, MSG_FFN_RESULT, partial.to_numpy())
+                    self._free_dequantized(layer_idx)
                 elif msg_type == MSG_ALL_LAYERS_DONE:
                     pass
 
