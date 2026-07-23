@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import math
 import socket
 import time
@@ -106,6 +107,8 @@ class RootNode:
                     lw_q = quantize_weights_dict(lw)
                     send_msg(conn, MSG_LAYER_WEIGHTS, (layer_idx, lw_q))
                     del lw, lw_q
+                    if layer_idx % 8 == 0:
+                        gc.collect()
             elif all_layer_weights and worker_id in all_layer_weights:
                 # Fallback: batch send (pre-computed weights)
                 wl = all_layer_weights[worker_id]
@@ -585,7 +588,7 @@ class RootNode:
         if o_weight is not None:
             ao_t = torch.mm(torch.from_numpy(attn_out.reshape(-1, attn_out.shape[-1])),
                             torch.from_numpy(o_weight))
-            attn_out = ao_t.reshape(attn_out.shape).numpy()
+            attn_out = ao_t.reshape(*attn_out.shape[:-1], hidden_dim).numpy()
 
         h = x + attn_out
 

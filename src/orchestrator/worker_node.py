@@ -129,7 +129,7 @@ class WorkerNode:
             print(f"Worker listening on {self.host}:{self.port}")
 
             conn, addr = server.accept()
-            conn.settimeout(180.0)
+            conn.settimeout(600.0)
 
             msg_type, obj = recv_msg(conn)
             if msg_type != MSG_SHARD_SPEC:

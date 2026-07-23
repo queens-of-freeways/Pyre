@@ -949,7 +949,7 @@ class StreamingWeights:
                 }
 
     def _read_tensor(self, name: str) -> torch.Tensor:
-        """Read a single tensor from mmap, return as torch bfloat16."""
+        """Read a single tensor from mmap, return as torch bfloat16 copy."""
         info = self._tensor_index[name]
         mm = info['mmap']
         dtype_str = info['dtype']
