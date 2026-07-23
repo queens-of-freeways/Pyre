@@ -6,6 +6,7 @@ version = "0.1.0"
 
 [tasks]
 pyre = { cmd = "pyre" }
+uninstall = { cmd = "bash scripts/uninstall.sh" }
 
 [dependencies]
 mojo = ">=1.0.0b2,<2"

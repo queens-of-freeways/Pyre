@@ -183,6 +183,22 @@ pixi run python tests/test_gemma4_e2e.py
 pixi run mojo build src/
 ```
 
+## Uninstall
+
+Removes the entry point, pixi environment, and the entire project directory:
+
+```bash
+bash scripts/uninstall.sh
+```
+
+Or from the pixi task (must be run from the project directory):
+
+```bash
+pixi run uninstall
+```
+
+> **Warning:** This deletes the project directory and is irreversible.
+
 ## Caveats
 
 - **Compilation delay**: MAX graph compilation takes 20–30s for small models, 1–2 min for larger ones (happens once on startup)
