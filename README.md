@@ -30,10 +30,9 @@ pyre ps
 git clone https://github.com/queens-of-freeways/Pyre.git
 cd Pyre
 pixi install
-ln -sf "$PWD/.pixi/envs/default/bin/pyre" ~/.local/bin/pyre
 ```
 
-That's it — pixi pulls Mojo, Python, PyTorch, transformers, zeroconf, and the MAX SDK automatically. The last line makes `pyre` available on your PATH.
+That's it — pixi pulls Mojo, Python, PyTorch, transformers, zeroconf, and the MAX SDK automatically. The editable install creates a `pyre` entry point at `~/.local/bin/pyre` that auto-forwards to pixi, so you can run it from anywhere without prefixing every command with `pixi run`.
 
 ## Usage
 
