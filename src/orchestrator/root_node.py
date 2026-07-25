@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import socket
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -35,6 +36,7 @@ class RootNode:
         ple_embedding: Optional[np.ndarray] = None,
         ple_projection: Optional[np.ndarray] = None,
         ple_projection_norm: Optional[np.ndarray] = None,
+        local_worker: Optional["WorkerNode"] = None,
     ):
         self.config = config
         self.all_layer_weights = all_layer_weights or {}
@@ -87,6 +89,15 @@ class RootNode:
         )
         for i, (host, port) in enumerate(worker_addrs):
             worker_id = i + 1
+            is_local = (local_worker is not None
+                        and host == "localhost"
+                        and port == local_worker.port)
+
+            # Set injection event before connecting so the worker's init
+            # loop sees it before entering the TCP receive path.
+            if is_local:
+                local_worker._local_injection_event = threading.Event()
+
             conn = self._connect_worker(host, port)
             p = self.partitions[worker_id]
             shard_spec = AttentionShardSpec(
@@ -105,10 +116,15 @@ class RootNode:
                         layer_idx, p, full_q=True, copy_weights=True,
                     )
                     lw_q = quantize_weights_dict(lw)
-                    send_msg(conn, MSG_LAYER_WEIGHTS, (layer_idx, lw_q))
+                    if is_local:
+                        local_worker._compressed[layer_idx] = lw_q
+                    else:
+                        send_msg(conn, MSG_LAYER_WEIGHTS, (layer_idx, lw_q))
                     del lw, lw_q
                     if layer_idx % 8 == 0:
                         gc.collect()
+                if is_local:
+                    local_worker._local_injection_event.set()
             elif all_layer_weights and worker_id in all_layer_weights:
                 # Fallback: batch send (pre-computed weights)
                 wl = all_layer_weights[worker_id]

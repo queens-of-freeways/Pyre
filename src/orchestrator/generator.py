@@ -157,6 +157,7 @@ def _build_gen(
     num_layers: int = 0,
     real_weights: bool = False,
     reload: bool = False,
+    local_worker: Optional["WorkerNode"] = None,
 ) -> Generator:
     from transformers import AutoTokenizer
 
@@ -192,6 +193,7 @@ def _build_gen(
         ple_embedding=wp.get_ple_embedding() if has_ple else None,
         ple_projection=wp.get_ple_projection() if has_ple else None,
         ple_projection_norm=wp.get_ple_projection_norm() if has_ple else None,
+        local_worker=local_worker,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model)
@@ -259,7 +261,7 @@ if __name__ == "__main__":
         ready.wait()
         worker_addrs.insert(0, ("localhost", local_worker.port))
 
-    gen = _build_gen(worker_addrs, model=args.model, num_layers=args.layers)
+    gen = _build_gen(worker_addrs, model=args.model, num_layers=args.layers, local_worker=local_worker)
 
     try:
         gen.generate(args.prompt, max_tokens=args.max_tokens, stream=True)

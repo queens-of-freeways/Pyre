@@ -4,6 +4,7 @@ import argparse
 import os
 import socket
 import sys
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -54,6 +55,7 @@ class WorkerNode:
         self._current_ffn_up = None
         self._current_ffn_down = None
         self._fallback_cache = {}  # {layer_idx: weights_dict}
+        self._local_injection_event = None  # set by RootNode for in-process workers
 
     def _get_fallback_weights(self, layer_idx):
         """Lazily generate and cache fallback weights per layer (avoids repeated random alloc)."""
@@ -153,34 +155,42 @@ class WorkerNode:
 
             send_msg(conn, MSG_READY)
 
-            # Receive layers one at a time via MSG_LAYER_WEIGHTS (streaming)
-            # Store compressed (Q8_0) payload; dequantize per-layer on first use.
+            # Check if weights were pre-injected by a local in-process root.
             self._compressed = {}
             self._dequantized = {}
             self.layer_weights = {}  # backward-compat alias — kept as live ref
             self.layer_props = {}
-            num_layers = self.config.num_layers
-            for layer_idx in range(num_layers):
-                msg_type, payload = recv_msg(conn)
-                if msg_type == MSG_LAYER_WEIGHTS:
-                    lidx, layer_payload = payload
-                elif msg_type == MSG_INIT_WEIGHTS:
-                    # Fallback: batch receive all layers at once
-                    layer_payload = payload
-                    if isinstance(layer_payload, dict):
-                        layer_payload = dequantize_weights_dict(layer_payload)
-                    for w_lidx, w_payload in layer_payload.get("weights", {}).items():
-                        self._compressed[w_lidx] = w_payload
-                    self.layer_props = layer_payload.get("props", {})
-                    break
-                else:
-                    raise ValueError(
-                        f"Expected LAYER_WEIGHTS ({MSG_LAYER_WEIGHTS}) "
-                        f"or INIT_WEIGHTS ({MSG_INIT_WEIGHTS}), got {msg_type}"
-                    )
+            if self._local_injection_event is not None:
+                self._local_injection_event.wait()
+                # All layers already injected into _compressed by RootNode
+                self.layer_props = {
+                    lidx: lw.get("_props", {})
+                    for lidx, lw in self._compressed.items()
+                }
+            else:
+                # Normal TCP streaming from remote root
+                num_layers = self.config.num_layers
+                for layer_idx in range(num_layers):
+                    msg_type, payload = recv_msg(conn)
+                    if msg_type == MSG_LAYER_WEIGHTS:
+                        lidx, layer_payload = payload
+                    elif msg_type == MSG_INIT_WEIGHTS:
+                        # Fallback: batch receive all layers at once
+                        layer_payload = payload
+                        if isinstance(layer_payload, dict):
+                            layer_payload = dequantize_weights_dict(layer_payload)
+                        for w_lidx, w_payload in layer_payload.get("weights", {}).items():
+                            self._compressed[w_lidx] = w_payload
+                        self.layer_props = layer_payload.get("props", {})
+                        break
+                    else:
+                        raise ValueError(
+                            f"Expected LAYER_WEIGHTS ({MSG_LAYER_WEIGHTS}) "
+                            f"or INIT_WEIGHTS ({MSG_INIT_WEIGHTS}), got {msg_type}"
+                        )
 
-                self._compressed[lidx] = layer_payload
-                self.layer_props[lidx] = layer_payload.get("_props", {})
+                    self._compressed[lidx] = layer_payload
+                    self.layer_props[lidx] = layer_payload.get("_props", {})
 
             needed_hds = set()
             for lp in self.layer_props.values():
