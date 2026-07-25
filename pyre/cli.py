@@ -1,6 +1,23 @@
+import os
+import sys
+
 import click
 
 from pyre.core import run_generation, start_worker, list_workers
+
+
+# Auto-forward to pixi when called from the pip-installed entry point
+# outside the pixi environment. This lets `pyre` work from anywhere
+# while still pulling all conda/pypi deps managed by pixi.
+if "PIXI_IN_SHELL" not in os.environ and "PIXI_PROJECT_ROOT" not in os.environ:
+    os.environ["PIXI_IN_SHELL"] = "1"
+    try:
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        os.chdir(project_root)
+        os.execvp("pixi", ["pixi", "run", "pyre"] + sys.argv[1:])
+    except FileNotFoundError:
+        # pixi not installed — proceed with system python
+        del os.environ["PIXI_IN_SHELL"]
 
 
 @click.group()
