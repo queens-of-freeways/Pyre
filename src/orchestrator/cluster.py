@@ -19,6 +19,16 @@ class NodeCap:
     net_bps: float
     barrier_latency_us: float
 
+def _unpack_rope_theta(tc, default: float = 10000.0) -> float:
+    """Extract rope_theta from a config that may nest it in rope_parameters dict."""
+    rp = getattr(tc, "rope_parameters", None)
+    if rp is None:
+        return default
+    if isinstance(rp, dict):
+        return rp.get("rope_theta", default)
+    return getattr(rp, "rope_theta", default)
+
+
 @dataclass
 class ModelConfig:
     hidden_dim: int
@@ -38,21 +48,52 @@ class ModelConfig:
         from transformers import AutoConfig
         cfg = AutoConfig.from_pretrained(model_id)
 
+        # Multimodal models (Qwen3_VL, Ornith, etc.) nest text config under
+        # "text_config" — fall back to that when top-level lookups return None.
+        tc = getattr(cfg, "text_config", cfg)
+
         hidden_dim = getattr(cfg, "hidden_size", getattr(cfg, "hidden_dim", None))
-        n_heads = getattr(cfg, "num_attention_heads", getattr(cfg, "num_heads", None))
-        n_kv_heads = getattr(cfg, "num_key_value_heads", n_heads)
-        head_dim = getattr(cfg, "head_dim", None) or (hidden_dim // n_heads)
-        ffn_dim = getattr(cfg, "intermediate_size", getattr(cfg, "ffn_dim", None))
-        num_layers = getattr(cfg, "num_hidden_layers", getattr(cfg, "num_layers", 1))
-        vocab_size = getattr(cfg, "vocab_size", 49152)
+        n_heads = (
+            getattr(cfg, "num_attention_heads", None)
+            or getattr(cfg, "num_heads", None)
+            or getattr(tc, "num_attention_heads", None)
+        )
+        n_kv_heads = (
+            getattr(cfg, "num_key_value_heads", None)
+            or getattr(tc, "num_key_value_heads", n_heads)
+        )
+        head_dim = (
+            getattr(cfg, "head_dim", None)
+            or getattr(tc, "head_dim", None)
+            or (hidden_dim // n_heads)
+        )
+        ffn_dim = (
+            getattr(cfg, "intermediate_size", getattr(cfg, "ffn_dim", None))
+            or getattr(tc, "intermediate_size", None)
+        )
+        num_layers = (
+            getattr(cfg, "num_hidden_layers", getattr(cfg, "num_layers", None))
+            or getattr(tc, "num_hidden_layers", 1)
+        )
+        vocab_size = (
+            getattr(cfg, "vocab_size", None)
+            or getattr(tc, "vocab_size", 49152)
+        )
         model_type = getattr(cfg, "model_type", "llama")
 
         if any(v is None for v in [hidden_dim, n_heads, head_dim, ffn_dim]):
             raise ValueError(f"Could not infer all model dimensions from {model_id} config")
 
-        ple_dim = getattr(cfg, "hidden_size_per_layer_input", 0)
-        rope_theta = getattr(cfg, "rope_theta", 10000.0)
-        max_seq_len = getattr(cfg, "max_position_embeddings", 2048)
+        ple_dim = getattr(cfg, "hidden_size_per_layer_input", 0) or getattr(tc, "hidden_size_per_layer_input", 0)
+        rope_theta = (
+            getattr(cfg, "rope_theta", None)
+            or getattr(tc, "rope_theta", None)
+            or _unpack_rope_theta(tc, 10000.0)
+        )
+        max_seq_len = (
+            getattr(cfg, "max_position_embeddings", None)
+            or getattr(tc, "max_position_embeddings", 2048)
+        )
 
         return ModelConfig(
             hidden_dim=hidden_dim,

@@ -17,7 +17,7 @@ class LayerProperties:
     has_v_proj: bool = True
     rope_fraction: float = 1.0
     use_v_norm: bool = False
-    attention_type: str = "standard"  # "standard", "gemma4_global", "gemma4_sliding"
+    attention_type: str = "standard"  # "standard", "gemma4_global", "gemma4_sliding", "linear"
     kv_source_layer: Optional[int] = None  # if set, this layer shares KV from this source
 
     @staticmethod
@@ -33,10 +33,14 @@ class LayerProperties:
     def gemma4_sliding(hd: int) -> "LayerProperties":
         return LayerProperties(head_dim=hd, attention_type="gemma4_sliding")
 
+    @staticmethod
+    def linear(hd: int = 0) -> "LayerProperties":
+        return LayerProperties(head_dim=hd, has_v_proj=False, attention_type="linear")
+
 
 @dataclass
 class LayerWeightSet:
-    q: torch.Tensor          # [hidden_dim, n_heads * head_dim] bfloat16
+    q: torch.Tensor          # [hidden_dim, n_heads * head_dim] bfloat16 (full attn only)
     k: torch.Tensor          # [hidden_dim, n_kv_heads * head_dim] bfloat16
     ffn_gate: torch.Tensor   # [hidden_dim, ffn_dim] bfloat16
     ffn_up: torch.Tensor     # [hidden_dim, ffn_dim] bfloat16
@@ -50,6 +54,18 @@ class LayerWeightSet:
     post_attention_layernorm: Optional[np.ndarray] = None  # [hidden_dim] float32
     has_v_proj: bool = True
     props: Optional[LayerProperties] = None
+
+    # Linear attention weights (only used when props.attention_type == "linear")
+    lin_in_proj_qkv: Optional[torch.Tensor] = None  # [8192, hidden_dim] bf16
+    lin_in_proj_z: Optional[torch.Tensor] = None    # [hidden_dim, hidden_dim] bf16
+    lin_in_proj_a: Optional[torch.Tensor] = None    # [d_state, hidden_dim] bf16
+    lin_in_proj_b: Optional[torch.Tensor] = None    # [d_state, hidden_dim] bf16
+    lin_conv1d: Optional[torch.Tensor] = None       # [8192, 1, d_conv] bf16
+    lin_A_log: Optional[torch.Tensor] = None        # [d_state] bf16
+    lin_dt_bias: Optional[torch.Tensor] = None      # [d_state] bf16
+    lin_norm: Optional[np.ndarray] = None            # [d_norm] float32
+    lin_out_proj: Optional[torch.Tensor] = None     # [hidden_dim, hidden_dim] bf16
+
     # PLE (Per-Layer Embeddings) per-layer weights (stored as float32, tiny)
     ple_gate: Optional[np.ndarray] = None      # [hidden_dim, ple_dim] float32
     ple_proj: Optional[np.ndarray] = None      # [ple_dim, hidden_dim] float32
@@ -352,102 +368,167 @@ def _load_sliced_weights(path: str) -> Optional[Dict[int, dict]]:
 
 def _infer_weight_keys(state: Dict[str, torch.Tensor], model_type: str = "llama",
                         cfg: Any = None) -> dict:
-    """Scan state dict keys and infer naming conventions."""
+    """Scan state dict keys and infer naming conventions.
+
+    Auto-detects the layer prefix (e.g. ``model``, ``model.language_model``,
+    ``transformer``) so models with non-standard wrappers (multimodal, custom
+    architectures) work without hardcoded assumptions.
+    """
     keys = list(state.keys())
 
-    layer_keys = [k for k in keys if re.match(r"model\.layers\.\d+\.", k)]
+    # Match any prefix before .layers.N. — e.g. "model.layers.0." or
+    # "model.language_model.layers.0." or "transformer.layers.0."
+    layer_rx = re.compile(r"^(.+)\.layers\.(\d+)\.(.+)$")
     entry = {}
-    for k in layer_keys:
-        m = re.match(r"model\.layers\.(\d+)\.(.+)", k)
+    layer_prefix = None
+    for k in keys:
+        m = layer_rx.match(k)
         if m:
-            entry.setdefault(int(m.group(1)), []).append(m.group(2))
+            prefix, lidx, suffix = m.group(1), int(m.group(2)), m.group(3)
+            entry.setdefault(lidx, []).append(suffix)
+            if layer_prefix is None:
+                layer_prefix = prefix
 
-    if not entry:
-        raise ValueError("No model.layers.N.* keys found in state dict")
+    if not entry or layer_prefix is None:
+        raise ValueError(
+            "No model.layers.N.* keys found in state dict — "
+            "tried pattern <prefix>.layers.<N>.<suffix>"
+        )
 
     first_idx = min(entry.keys())
     first_keys = entry[first_idx]
+    lp = layer_prefix  # shorthand
 
     def has(pat, keys=first_keys):
         return any(pat in k for k in keys)
 
-    # Detect norm key pattern
+    # --- Norms ---
     if has("input_layernorm.weight"):
-        input_norm_tmpl = "model.layers.{}.input_layernorm.weight"
+        input_norm_tmpl = f"{lp}.layers.{{}}.input_layernorm.weight"
     elif has("attention_norm.weight"):
-        input_norm_tmpl = "model.layers.{}.attention_norm.weight"
+        input_norm_tmpl = f"{lp}.layers.{{}}.attention_norm.weight"
     else:
         input_norm_tmpl = None
 
     if has("post_attention_layernorm.weight"):
-        post_attn_norm_tmpl = "model.layers.{}.post_attention_layernorm.weight"
+        post_attn_norm_tmpl = f"{lp}.layers.{{}}.post_attention_layernorm.weight"
     elif has("ffn_norm.weight"):
-        post_attn_norm_tmpl = "model.layers.{}.ffn_norm.weight"
+        post_attn_norm_tmpl = f"{lp}.layers.{{}}.ffn_norm.weight"
     else:
         post_attn_norm_tmpl = None
 
-    # Detect attention key pattern
-    if has("self_attn.q_proj"):
-        attn_tmpl = "model.layers.{}.self_attn.{}_proj.weight"
+    # --- Attention ---
+    # Check for standard self-attention OR linear attention (Qwen3 hybrid).
+    # We need to scan ALL layer keys, not just first_idx, to handle hybrids.
+    has_standard_attn = any("self_attn.q_proj" in k for kidx_keys in entry.values() for k in kidx_keys)
+    has_linear_attn = any("linear_attn.in_proj_qkv" in k for kidx_keys in entry.values() for k in kidx_keys)
+    if has_standard_attn:
+        attn_tmpl = f"{lp}.layers.{{}}.self_attn.{{}}_proj.weight"
+    elif has_linear_attn:
+        attn_tmpl = f"{lp}.layers.{{}}.linear_attn.out_proj.weight"
     elif has("attention.wq"):
-        attn_tmpl = "model.layers.{}.attention.w{}.weight"
+        attn_tmpl = f"{lp}.layers.{{}}.attention.w{{}}.weight"
     else:
         raise ValueError(f"Cannot detect attention key pattern from {first_keys}")
 
-    # Detect QKV bias
+    # --- QKV bias ---
     has_qkv_bias = has("q_proj.bias")
 
-    # Detect MLP key pattern (gated vs non-gated)
+    # --- MLP ---
     ffn_gated = has("mlp.gate_proj") or (has("mlp.gate") and not has("mlp.fc1"))
     if ffn_gated:
         if has("mlp.gate_proj"):
-            mlp_tmpl = "model.layers.{}.mlp.{}_proj.weight"
+            mlp_tmpl = f"{lp}.layers.{{}}.mlp.{{}}_proj.weight"
         elif has("mlp.gate"):
-            mlp_tmpl = "model.layers.{}.mlp.{}.weight"
+            mlp_tmpl = f"{lp}.layers.{{}}.mlp.{{}}.weight"
         else:
             mlp_tmpl = None
     else:
         if has("mlp.fc1"):
-            mlp_tmpl = "model.layers.{}.mlp.fc{}.weight"
+            mlp_tmpl = f"{lp}.layers.{{}}.mlp.fc{{}}.weight"
         else:
             mlp_tmpl = None
 
-    # Detect per-layer anomalies (missing v_proj = Gemma 4 global layers)
+    # --- Per-layer anomalies: missing v_proj (Gemma 4) or linear attention (Qwen3 hybrid) ---
     per_layer = {}
     is_gemma4 = model_type == "gemma4"
     for layer_idx, layer_keys in entry.items():
         has_v = any("v_proj" in k for k in layer_keys)
+        is_linear = any("linear_attn" in k for k in layer_keys)
         per_layer[layer_idx] = {
             "has_v_proj": has_v,
             "is_gemma4_global": is_gemma4 and not has_v,
+            "attention_type": "linear" if is_linear else "full",
         }
-        # For Gemma 4 global layers, detect head_dim from k_proj shape
         if is_gemma4 and not has_v:
-            k_key = f"model.layers.{layer_idx}.self_attn.k_proj.weight"
+            k_key = f"{lp}.layers.{layer_idx}.self_attn.k_proj.weight"
             if k_key in state:
                 n_kv_local = getattr(cfg, "num_key_value_heads", None)
                 if n_kv_local:
                     per_layer[layer_idx]["head_dim"] = state[k_key].shape[0] // n_kv_local
         elif is_gemma4 and has_v:
-            # Sliding layers: use default or detect
-            per_layer[layer_idx]["head_dim"] = None  # will use default from config
+            per_layer[layer_idx]["head_dim"] = None
 
-    embed_key = "model.embed_tokens.weight"
-    lm_head_key = "lm_head.weight" if "lm_head.weight" in state else embed_key
-    norm_key = "model.norm.weight" if "model.norm.weight" in state else None
+    # Template for reading linear-attention weights — the suffix has
+    # variable depth (e.g. "linear_attn.in_proj_qkv.weight"), so we
+    # just pass the full key suffix directly.
+    lin_weight_tmpl = f"{lp}.layers.{{}}.{{}}" if has_linear_attn else None
 
-    # Detect PLE (Per-Layer Embeddings) for Gemma 4
-    has_ple = "model.embed_tokens_per_layer.weight" in state
-    if has_ple:
+    # --- Top-level keys (embed / lm_head / norm) ---
+    embed_key_candidates = [
+        f"{lp}.embed_tokens.weight",
+        "model.embed_tokens.weight",
+        f"{lp}.wte.weight",
+        "transformer.wte.weight",
+    ]
+    embed_key = next((k for k in embed_key_candidates if k in state), None)
+    if embed_key is None:
+        # fallback: any key that looks like embed_tokens / wte
+        embed_key = next(
+            (k for k in keys
+             if k.endswith("embed_tokens.weight") or k.endswith("wte.weight")),
+            None,
+        )
+
+    lm_head_key = None
+    for candidate in [
+        "lm_head.weight",
+        f"{lp}.lm_head.weight",
+        f"{lp}.embed_tokens.weight",
+    ]:
+        if candidate in state:
+            lm_head_key = candidate
+            break
+    if lm_head_key is None and embed_key is not None:
+        # tied embeddings
+        lm_head_key = embed_key
+
+    norm_key = None
+    for candidate in [
+        f"{lp}.norm.weight",
+        "model.norm.weight",
+        f"{lp}.ln_f.weight",
+        "transformer.ln_f.weight",
+    ]:
+        if candidate in state:
+            norm_key = candidate
+            break
+
+    # --- PLE (Gemma 4) ---
+    if f"{lp}.embed_tokens_per_layer.weight" in state:
+        has_ple = True
         ple_keys = {}
         for layer_idx, lk in entry.items():
             has_ple_gate = any("per_layer_input_gate" in k for k in lk)
             ple_keys[layer_idx] = has_ple_gate
     else:
+        has_ple = False
         ple_keys = {}
 
     return {
+        "layer_prefix": lp,
         "attn_tmpl": attn_tmpl,
+        "lin_weight_tmpl": lin_weight_tmpl,
         "mlp_tmpl": mlp_tmpl,
         "ffn_gated": ffn_gated,
         "per_layer": per_layer,
@@ -855,6 +936,39 @@ class StreamingWeights:
         self.model_id = model_id
         self.cfg = AutoConfig.from_pretrained(model_id)
 
+        # Multimodal models nest text backbone config under text_config
+        tc = getattr(self.cfg, "text_config", self.cfg)
+
+        # Extract dimensions from config (try top-level first, then text_config)
+        self.hidden_dim = getattr(self.cfg, "hidden_size", None) or getattr(tc, "hidden_size", None)
+        self.n_heads = (
+            getattr(self.cfg, "num_attention_heads", None)
+            or getattr(tc, "num_attention_heads", None)
+        )
+        self.n_kv_heads = (
+            getattr(self.cfg, "num_key_value_heads", None)
+            or getattr(tc, "num_key_value_heads", self.n_heads)
+        )
+        self.default_head_dim = (
+            getattr(self.cfg, "head_dim", None)
+            or getattr(tc, "head_dim", None)
+            or (self.hidden_dim // self.n_heads if self.n_heads else None)
+        )
+        self.ffn_dim = (
+            getattr(self.cfg, "intermediate_size", None)
+            or getattr(tc, "intermediate_size", None)
+        )
+        self.vocab_size = (
+            getattr(self.cfg, "vocab_size", None)
+            or getattr(tc, "vocab_size", None)
+        )
+        self.num_layers = num_layers or (
+            getattr(self.cfg, "num_hidden_layers", None)
+            or getattr(tc, "num_hidden_layers", None)
+            or getattr(self.cfg, "num_layers", None)
+            or getattr(tc, "num_layers", None)
+        )
+
         # Resolve safetensors file paths and memory-map them
         self._tensor_index: Dict[str, dict] = {}
         self._mmaps: list = []
@@ -863,21 +977,7 @@ class StreamingWeights:
         # Infer naming convention from tensor names/shapes (never loads data)
         mock_state = _ShapeState(self._tensor_index)
         model_type = getattr(self.cfg, "model_type", "llama")
-        self._key_info = _infer_weight_keys(mock_state, model_type=model_type, cfg=self.cfg)
-
-        # Extract dimensions from config
-        self.hidden_dim = getattr(self.cfg, "hidden_size", None)
-        self.n_heads = getattr(self.cfg, "num_attention_heads", None)
-        self.n_kv_heads = getattr(self.cfg, "num_key_value_heads", self.n_heads)
-        self.default_head_dim = getattr(self.cfg, "head_dim", None) or (
-            self.hidden_dim // self.n_heads if self.n_heads else None
-        )
-        self.ffn_dim = getattr(self.cfg, "intermediate_size", None)
-        self.vocab_size = getattr(self.cfg, "vocab_size", None)
-        self.num_layers = num_layers or getattr(
-            self.cfg, "num_hidden_layers",
-            getattr(self.cfg, "num_layers", None),
-        )
+        self._key_info = _infer_weight_keys(mock_state, model_type=model_type, cfg=self.cfg or tc)
 
         # Build per-layer property info
         self._layer_props: Dict[int, LayerProperties] = {}
@@ -891,6 +991,8 @@ class StreamingWeights:
                 else:
                     hd = pl.get("head_dim", self.default_head_dim)
                     self._layer_props[lidx] = LayerProperties.gemma4_sliding(hd)
+            elif pl.get("attention_type") == "linear":
+                self._layer_props[lidx] = LayerProperties.linear()
             else:
                 self._layer_props[lidx] = LayerProperties.standard(self.default_head_dim)
 
@@ -999,14 +1101,8 @@ class StreamingWeights:
 
     def get_layer(self, idx: int) -> LayerWeightSet:
         ki = self._key_info
-        tmpl = ki["attn_tmpl"]
 
-        q_raw = self._read_tensor(tmpl.format(idx, "q"))
-        k_raw = self._read_tensor(tmpl.format(idx, "k"))
-        has_v = ki["per_layer"].get(idx, {}).get("has_v_proj", True)
-        v_raw = self._read_tensor(tmpl.format(idx, "v")) if has_v else None
-        o_raw = self._read_tensor(tmpl.format(idx, "o"))
-
+        # --- Shared: MLP + norms ---
         mlp_tmpl = ki["mlp_tmpl"]
         if ki["ffn_gated"]:
             gate_raw = self._read_tensor(mlp_tmpl.format(idx, "gate"))
@@ -1019,20 +1115,9 @@ class StreamingWeights:
             up_raw = fc1
             down_raw = fc2
 
-        q = _torch_to_b16(q_raw, transpose=True)
-        k = _torch_to_b16(k_raw, transpose=True)
-        v = _torch_to_b16(v_raw, transpose=True) if v_raw is not None else None
-        o = _torch_to_b16(o_raw, transpose=True)
         gate = _torch_to_b16(gate_raw, transpose=True)
         up = _torch_to_b16(up_raw, transpose=True)
         down = _torch_to_b16(down_raw, transpose=True)
-
-        q_bias = k_bias = v_bias = None
-        if ki.get("has_qkv_bias"):
-            bias_tmpl = tmpl.replace(".weight", ".bias")
-            q_bias = self._read_numpy(bias_tmpl.format(idx, "q"))
-            k_bias = self._read_numpy(bias_tmpl.format(idx, "k"))
-            v_bias = self._read_numpy(bias_tmpl.format(idx, "v"))
 
         input_norm = post_attn_norm = None
         input_norm_tmpl = ki.get("input_norm_tmpl")
@@ -1044,15 +1129,76 @@ class StreamingWeights:
             post_attn_norm_raw = self._read_tensor(post_attn_norm_tmpl.format(idx))
             post_attn_norm = post_attn_norm_raw.to(torch.float32).cpu().numpy()
 
-        return LayerWeightSet(
-            q=q, k=k, v=v, o=o,
-            ffn_gate=gate, ffn_up=up, ffn_down=down,
-            q_bias=q_bias, k_bias=k_bias, v_bias=v_bias,
-            input_layernorm=input_norm,
-            post_attention_layernorm=post_attn_norm,
-            has_v_proj=has_v,
-            props=self._layer_props.get(idx),
-        )
+        # --- Per-layer attention dispatch ---
+        per_layer_info = ki["per_layer"].get(idx, {})
+        attn_type = per_layer_info.get("attention_type", "full")
+        lt = ki.get("lin_weight_tmpl")  # e.g. "model.language_model.layers.{}.{}"
+
+        if attn_type == "linear" and lt is not None:
+            # ── Linear attention (Mamba2‑style SSM) ──
+            lk = lambda suffix: lt.format(idx, suffix)
+            qkv_raw = self._read_tensor(lk("linear_attn.in_proj_qkv.weight"))
+            z_raw = self._read_tensor(lk("linear_attn.in_proj_z.weight"))
+            a_raw = self._read_tensor(lk("linear_attn.in_proj_a.weight"))
+            b_raw = self._read_tensor(lk("linear_attn.in_proj_b.weight"))
+            conv1d_raw = self._read_tensor(lk("linear_attn.conv1d.weight"))
+            a_log_raw = self._read_tensor(lk("linear_attn.A_log"))
+            dt_bias_raw = self._read_tensor(lk("linear_attn.dt_bias"))
+            out_raw = self._read_tensor(lk("linear_attn.out_proj.weight"))
+
+            norm_raw = None
+            nk = lk("linear_attn.norm.weight")
+            if nk in self._tensor_index:
+                norm_raw = self._read_tensor(nk)
+
+            return LayerWeightSet(
+                q=_torch_to_b16(qkv_raw.clone(), transpose=True),  # placeholder — not standard q/k/v
+                k=_torch_to_b16(qkv_raw.clone(), transpose=True),  # placeholder
+                ffn_gate=gate, ffn_up=up, ffn_down=down,
+                input_layernorm=input_norm,
+                post_attention_layernorm=post_attn_norm,
+                props=self._layer_props.get(idx),
+                # Linear attention specific
+                lin_in_proj_qkv=_torch_to_b16(qkv_raw, transpose=True),
+                lin_in_proj_z=_torch_to_b16(z_raw, transpose=True),
+                lin_in_proj_a=_torch_to_b16(a_raw, transpose=True),
+                lin_in_proj_b=_torch_to_b16(b_raw, transpose=True),
+                lin_conv1d=_torch_to_b16(conv1d_raw, transpose=False),
+                lin_A_log=_torch_to_b16(a_log_raw, transpose=False),
+                lin_dt_bias=_torch_to_b16(dt_bias_raw, transpose=False),
+                lin_norm=norm_raw.to(torch.float32).cpu().numpy() if norm_raw is not None else None,
+                lin_out_proj=_torch_to_b16(out_raw, transpose=True),
+            )
+        else:
+            # ── Standard full attention ──
+            tmpl = ki["attn_tmpl"]
+            q_raw = self._read_tensor(tmpl.format(idx, "q"))
+            k_raw = self._read_tensor(tmpl.format(idx, "k"))
+            has_v = per_layer_info.get("has_v_proj", True)
+            v_raw = self._read_tensor(tmpl.format(idx, "v")) if has_v else None
+            o_raw = self._read_tensor(tmpl.format(idx, "o"))
+
+            q = _torch_to_b16(q_raw, transpose=True)
+            k = _torch_to_b16(k_raw, transpose=True)
+            v = _torch_to_b16(v_raw, transpose=True) if v_raw is not None else None
+            o = _torch_to_b16(o_raw, transpose=True)
+
+            q_bias = k_bias = v_bias = None
+            if ki.get("has_qkv_bias"):
+                bias_tmpl = tmpl.replace(".weight", ".bias")
+                q_bias = self._read_numpy(bias_tmpl.format(idx, "q"))
+                k_bias = self._read_numpy(bias_tmpl.format(idx, "k"))
+                v_bias = self._read_numpy(bias_tmpl.format(idx, "v"))
+
+            return LayerWeightSet(
+                q=q, k=k, v=v, o=o,
+                ffn_gate=gate, ffn_up=up, ffn_down=down,
+                q_bias=q_bias, k_bias=k_bias, v_bias=v_bias,
+                input_layernorm=input_norm,
+                post_attention_layernorm=post_attn_norm,
+                has_v_proj=has_v,
+                props=self._layer_props.get(idx),
+            )
 
     def get_embedding(self) -> np.ndarray:
         return self._read_numpy(self._key_info["embed_key"])
@@ -1159,7 +1305,6 @@ class WeightProvider:
         hd = props.head_dim
 
         def _tslice(arr, slc):
-            """Slice a torch.Tensor or np.ndarray, returning float32 numpy."""
             if arr is None:
                 return None
             if isinstance(arr, torch.Tensor):
@@ -1184,7 +1329,23 @@ class WeightProvider:
                 slc = arr[key_start:key_end, :]
             return _tslice(arr, slc)
 
-        if full_q:
+        # ── Attention dispatch by type ──
+        is_linear = props.attention_type == "linear"
+        if is_linear:
+            # Linear attention: no per-head slicing — weights are monolithic
+            attn = {
+                "type": "linear",
+                "in_proj_qkv": _ensure_f32(lw.lin_in_proj_qkv.to(torch.float32).cpu().numpy()),
+                "in_proj_z": _ensure_f32(lw.lin_in_proj_z.to(torch.float32).cpu().numpy()),
+                "in_proj_a": _ensure_f32(lw.lin_in_proj_a.to(torch.float32).cpu().numpy()),
+                "in_proj_b": _ensure_f32(lw.lin_in_proj_b.to(torch.float32).cpu().numpy()),
+                "conv1d": _ensure_f32(lw.lin_conv1d.to(torch.float32).cpu().numpy()),
+                "A_log": _ensure_f32(lw.lin_A_log.to(torch.float32).cpu().numpy()),
+                "dt_bias": _ensure_f32(lw.lin_dt_bias.to(torch.float32).cpu().numpy()),
+                "norm": lw.lin_norm.copy() if lw.lin_norm is not None else None,
+                "out_proj": _ensure_f32(lw.lin_out_proj.to(torch.float32).cpu().numpy()),
+            }
+        elif full_q:
             attn = {
                 "q": _slice(lw.q, self.full.n_heads * hd),
                 "k": _slice(lw.k, self.full.n_kv_heads * hd),
