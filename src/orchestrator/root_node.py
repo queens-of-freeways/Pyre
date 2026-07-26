@@ -113,24 +113,32 @@ class RootNode:
             if weight_provider is not None:
                 print(f"  [worker {worker_id}] starting weight stream for {config.num_layers} layers...", flush=True)
                 t_start = time.time()
+                # Cache quantized layers across workers so worker 2+ reuses worker 1's work
+                if not hasattr(self, '_quantized_layer_cache'):
+                    self._quantized_layer_cache = {}
                 for layer_idx in range(config.num_layers):
                     t0 = time.time()
-                    lw = weight_provider._layer_weights_for_node(
-                        layer_idx, p, full_q=True, copy_weights=True,
-                    )
+                    if layer_idx in self._quantized_layer_cache:
+                        lw_q = self._quantized_layer_cache[layer_idx]
+                        load_info = "(cached)"
+                    else:
+                        lw = weight_provider._layer_weights_for_node(
+                            layer_idx, p, full_q=True, copy_weights=True,
+                        )
+                        lw_q = quantize_weights_dict(lw)
+                        self._quantized_layer_cache[layer_idx] = lw_q
+                        del lw
+                        load_info = ""
                     t1 = time.time()
-                    lw_q = quantize_weights_dict(lw)
-                    t2 = time.time()
                     if is_local:
                         local_worker._compressed[layer_idx] = lw_q
                     else:
                         send_msg(conn, MSG_LAYER_WEIGHTS, (layer_idx, lw_q))
-                    t3 = time.time()
-                    del lw, lw_q
+                    t2 = time.time()
                     if layer_idx % 8 == 0:
                         gc.collect()
                     elapsed = time.time() - t_start
-                    print(f"  [worker {worker_id}] layer {layer_idx}: load={t1-t0:.1f}s quant={t2-t1:.1f}s send={t3-t2:.1f}s total={elapsed:.0f}s", flush=True)
+                    print(f"  [worker {worker_id}] layer {layer_idx}: {load_info}send={t2-t1:.1f}s total={elapsed:.0f}s", flush=True)
                 if is_local:
                     local_worker._local_injection_event.set()
                 print(f"  [worker {worker_id}] weight streaming done in {time.time()-t_start:.1f}s", flush=True)
