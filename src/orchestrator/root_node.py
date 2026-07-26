@@ -26,23 +26,41 @@ from src.orchestrator.quantizer import quantize_weights_dict
 
 _PYRE_KERNELS = None
 
+def _load_mojo_runtime():
+    """Pre-load Mojo runtime .so dependencies so dlopen can resolve them.
+
+    pyre_kernels.so was compiled with an absolute RUNPATH pointing to the
+    build machine's pixi lib directory.  On other machines that path won't
+    exist, so we load the dependencies ourselves with RTLD_GLOBAL to make
+    their symbols available to the subsequent Python import.
+    """
+    import os, ctypes
+    pixi_root = os.environ.get('PIXI_PROJECT_ROOT')
+    if not pixi_root:
+        return
+    lib_dir = os.path.join(pixi_root, '.pixi', 'envs', 'default', 'lib')
+    if not os.path.isdir(lib_dir):
+        return
+    # Order matters: leaf dependencies first.
+    for dep in ('libMSupportGlobals.so', 'libKGENCompilerRTShared.so',
+                'libNVPTX.so', 'libAsyncRTRuntimeGlobals.so',
+                'libAsyncRTMojoBindings.so'):
+        path = os.path.join(lib_dir, dep)
+        if os.path.exists(path):
+            try:
+                ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+
 def _get_pyre_kernels():
     global _PYRE_KERNELS
     if _PYRE_KERNELS is None:
-        import sys, os
-
-        # The .so was compiled with an absolute RUNPATH pointing to the build
-        # machine's pixi lib dir. Set LD_LIBRARY_PATH so dlopen can find the
-        # Mojo runtime dependencies on any machine.
-        pixi_root = os.environ.get('PIXI_PROJECT_ROOT')
-        if pixi_root:
-            lib_dir = os.path.join(pixi_root, '.pixi', 'envs', 'default', 'lib')
-            if os.path.isdir(lib_dir):
-                existing = os.environ.get('LD_LIBRARY_PATH', '')
-                if lib_dir not in existing:
-                    os.environ['LD_LIBRARY_PATH'] = lib_dir + (':' + existing if existing else '')
-
-        _kernels_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'kernels')
+        import sys
+        _load_mojo_runtime()
+        _kernels_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'kernels',
+        )
         if _kernels_dir not in sys.path:
             sys.path.insert(0, _kernels_dir)
         import pyre_kernels as _pk
