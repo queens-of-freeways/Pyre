@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import gc
-import math
 import socket
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
 from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import DeviceRef
@@ -24,6 +22,20 @@ from src.orchestrator.protocol import (
     MSG_DECODE_STEP, MSG_LAYER_WEIGHTS,
 )
 from src.orchestrator.quantizer import quantize_weights_dict
+
+
+_PYRE_KERNELS = None
+
+def _get_pyre_kernels():
+    global _PYRE_KERNELS
+    if _PYRE_KERNELS is None:
+        import sys, os
+        _kernels_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'kernels')
+        if _kernels_dir not in sys.path:
+            sys.path.insert(0, _kernels_dir)
+        import pyre_kernels as _pk
+        _PYRE_KERNELS = _pk
+    return _PYRE_KERNELS
 
 
 class RootNode:
@@ -56,6 +68,16 @@ class RootNode:
         seq_len = p0["seq_end"] - p0["seq_start"]
 
         needed_hds = {config.head_dim}
+        if all_layer_weights and 0 in all_layer_weights:
+            for lw in all_layer_weights[0].values():
+                hd = lw.get("_props", {}).get("head_dim")
+                if hd is not None:
+                    needed_hds.add(hd)
+        elif weight_provider is not None:
+            for lidx in range(config.num_layers):
+                lp = weight_provider.get_layer_props(lidx)
+                if lp is not None:
+                    needed_hds.add(lp.head_dim)
 
         attn_shard_base = AttentionShardSpec(
             ffn_dim_start=p0["ffn_start"], ffn_dim_end=p0["ffn_end"],
@@ -129,6 +151,32 @@ class RootNode:
                     worker_data.setdefault("props", {})[lidx] = lp
                 worker_data_q = quantize_weights_dict(worker_data)
                 send_msg(conn, MSG_INIT_WEIGHTS, worker_data_q)
+        else:
+            # No weights provided — send fallback random weights so workers can proceed
+            for conn, worker_id, p, is_local in self.worker_info:
+                width = p["ffn_end"] - p["ffn_start"]
+                fallback = {"weights": {}, "props": {}}
+                for lidx in range(config.num_layers):
+                    hd = config.head_dim
+                    n_q = config.n_heads
+                    n_kv = config.n_kv_heads
+                    fallback["weights"][lidx] = {
+                        "attn": {
+                            "q": np.random.randn(config.hidden_dim, n_q * hd).astype(np.float32),
+                            "k": np.random.randn(config.hidden_dim, n_kv * hd).astype(np.float32),
+                            "v": np.random.randn(config.hidden_dim, n_kv * hd).astype(np.float32),
+                            "o": np.random.randn(n_q * hd, config.hidden_dim).astype(np.float32),
+                        },
+                        "ffn": {
+                            "gate": np.random.randn(config.hidden_dim, width).astype(np.float32),
+                            "up": np.random.randn(config.hidden_dim, width).astype(np.float32),
+                            "down": np.random.randn(width, config.hidden_dim).astype(np.float32),
+                        },
+                        "_props": {"head_dim": hd},
+                    }
+                    fallback["props"][lidx] = {"head_dim": hd}
+                fallback_q = quantize_weights_dict(fallback)
+                send_msg(conn, MSG_INIT_WEIGHTS, fallback_q)
 
     def _solve_partitions(self, n):
         ffn_dim = self.config.ffn_dim
@@ -203,39 +251,27 @@ class RootNode:
 
     @staticmethod
     def _softmax(x, axis=-1):
-        x_max = np.max(x, axis=axis, keepdims=True)
-        exp = np.exp(x - x_max)
-        return exp / np.sum(exp, axis=axis, keepdims=True)
+        out = np.empty_like(x)
+        _get_pyre_kernels().softmax(x, out)
+        return out
 
     @staticmethod
     def _rms_norm(x, weight, eps=1e-6):
-        variance = np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True)
-        x_norm = x / np.sqrt(variance + eps)
-        return (x_norm * weight).astype(np.float32)
+        out = np.empty_like(x)
+        _get_pyre_kernels().rms_norm(x, weight, out)
+        return out
 
     @staticmethod
     def _apply_rope(x, rope_fraction=1.0, theta=10000.0, start_pos=0):
-        batch, n_heads, seq_len, head_dim = x.shape
-        dims = int(head_dim * rope_fraction)
-        if dims < 2:
-            return x
-        half = dims // 2
-        pos = np.arange(start_pos, start_pos + seq_len, dtype=np.float32)
-        freq = 1.0 / (theta ** (np.arange(0, dims, 2, dtype=np.float32) / dims))
-        cos = np.cos(pos[:, None] * freq[None, :])
-        sin = np.sin(pos[:, None] * freq[None, :])
-        x_rot = x[:, :, :, :dims]
-        x1 = x_rot[..., :half]
-        x2 = x_rot[..., half:dims]
-        out = x.copy()
-        out[:, :, :, :half] = x1 * cos - x2 * sin
-        out[:, :, :, half:dims] = x1 * sin + x2 * cos
+        out = np.empty_like(x)
+        _get_pyre_kernels().apply_rope(x, out, np.float32(theta), np.int32(start_pos), np.float32(rope_fraction))
         return out
 
     @staticmethod
     def _apply_v_norm(v):
-        rms = np.sqrt(np.mean(v.astype(np.float64) ** 2, axis=-1, keepdims=True) + 1e-6)
-        return (v / rms).astype(np.float32)
+        out = np.empty_like(v)
+        _get_pyre_kernels().apply_v_norm(v, out)
+        return out
 
     def _compute_attention(self, all_qkv, layer_idx: int = 0,
                             kv_cache: Optional[dict] = None,
@@ -319,13 +355,11 @@ class RootNode:
     def _apply_ple_to_hidden(hidden: np.ndarray, ple_signal: np.ndarray,
                               ple_gate: np.ndarray, ple_proj: np.ndarray,
                               ple_post_norm: np.ndarray) -> np.ndarray:
-        def gelu(x):
-            x_clamped = np.clip(x, -100, 100)
-            return 0.5 * x_clamped * (1.0 + np.tanh(math.sqrt(2.0 / math.pi) * (x_clamped + 0.044715 * x_clamped ** 3)))
         residual = hidden.copy()
         gated = hidden @ ple_gate
-        gated = gelu(gated)
-        gated = gated * ple_signal
+        gated_out = np.empty_like(gated)
+        _get_pyre_kernels().gelu(gated, gated_out)
+        gated = gated_out * ple_signal
         hidden_add = gated @ ple_proj
         mean_sq = np.mean(hidden_add.astype(np.float64) ** 2, axis=-1, keepdims=True)
         hidden_add = (hidden_add / np.sqrt(mean_sq + 1e-6) * ple_post_norm).astype(np.float32)
@@ -674,27 +708,28 @@ class RootNode:
                 wv_r = np.random.randn(hidden_dim, n_kv * layer_hd).astype(np.float32)
                 rw_attn["v"] = wv_r
 
-            xn_t = torch.from_numpy(x_norm)[0]
-            wq_t = torch.from_numpy(wq_r)
-            wk_t = torch.from_numpy(wk_r)
-            q_t = torch.mm(xn_t, wq_t)
-            k_t = torch.mm(xn_t, wk_t)
+            xn_2d = x_norm[0:1]
+            q = np.empty((1, n_heads * layer_hd), dtype=np.float32)
+            k = np.empty((1, n_kv * layer_hd), dtype=np.float32)
+            _get_pyre_kernels().matmul_f32(xn_2d, wq_r, q)
+            _get_pyre_kernels().matmul_f32(xn_2d, wk_r, k)
 
             q_bias = rw_attn.get("q_bias")
             k_bias = rw_attn.get("k_bias")
             if q_bias is not None:
-                q_t += torch.from_numpy(q_bias.astype(np.float32))
+                q += q_bias.astype(np.float32).reshape(1, -1)
             if k_bias is not None:
-                k_t += torch.from_numpy(k_bias.astype(np.float32))
+                k += k_bias.astype(np.float32).reshape(1, -1)
 
-            q = q_t.reshape(1, 1, n_heads, layer_hd).numpy()
-            k = k_t.reshape(1, 1, n_kv, layer_hd).numpy()
+            q = q.reshape(1, 1, n_heads, layer_hd)
+            k = k.reshape(1, 1, n_kv, layer_hd)
             if wv_r is not None:
-                v_t = torch.mm(xn_t, torch.from_numpy(wv_r))
+                v = np.empty((1, n_kv * layer_hd), dtype=np.float32)
+                _get_pyre_kernels().matmul_f32(xn_2d, wv_r, v)
                 v_bias = rw_attn.get("v_bias")
                 if v_bias is not None:
-                    v_t += torch.from_numpy(v_bias.astype(np.float32))
-                v = v_t.reshape(1, 1, n_kv, layer_hd).numpy()
+                    v += v_bias.astype(np.float32).reshape(1, -1)
+                v = v.reshape(1, 1, n_kv, layer_hd)
             else:
                 v = k.copy()
 
@@ -740,9 +775,9 @@ class RootNode:
 
             o_weight = root_w.get("attn", {}).get("o")
             if o_weight is not None:
-                ao_t = torch.mm(torch.from_numpy(attn_out.reshape(-1, attn_out.shape[-1])),
-                                torch.from_numpy(o_weight))
-                attn_out = ao_t.reshape(*attn_out.shape[:-1], hidden_dim).numpy()
+                ao = np.empty((1, hidden_dim), dtype=np.float32)
+                _get_pyre_kernels().matmul_f32(attn_out.reshape(1, -1), o_weight, ao)
+                attn_out = ao.reshape(*attn_out.shape[:-1], hidden_dim)
 
         h = x + attn_out
 
@@ -769,13 +804,15 @@ class RootNode:
             ffn_down_r = np.random.randn(width0, hidden_dim).astype(np.float32)
             rw_ffn["down"] = ffn_down_r
 
-        hn_t = torch.from_numpy(h_norm)[0]
-        gate_t = torch.mm(hn_t, torch.from_numpy(ffn_gate_r))
-        up_t = torch.mm(hn_t, torch.from_numpy(ffn_up_r))
-        gate_sig = torch.sigmoid(gate_t)
-        hidden_t = gate_t * gate_sig * up_t
-        ffn_t = torch.mm(hidden_t, torch.from_numpy(ffn_down_r))
-        ffn_out = ffn_t.numpy().reshape(h_norm.shape)
+        gate = np.empty((1, width0), dtype=np.float32)
+        up = np.empty((1, width0), dtype=np.float32)
+        _get_pyre_kernels().matmul_f32(h_norm[0:1], ffn_gate_r, gate)
+        _get_pyre_kernels().matmul_f32(h_norm[0:1], ffn_up_r, up)
+        hidden = np.empty_like(gate)
+        _get_pyre_kernels().silu_mul(gate, up, hidden)
+        ffn_out = np.empty((1, hidden_dim), dtype=np.float32)
+        _get_pyre_kernels().matmul_f32(hidden, ffn_down_r, ffn_out)
+        ffn_out = ffn_out.reshape(h_norm.shape)
 
         # Broadcast decode step to all workers, then collect
         for idx, worker_id in enumerate(self.worker_ids):

@@ -7,19 +7,40 @@ import numpy as np
 
 
 def quantize_q80(arr: np.ndarray, block_size: int = 32) -> Tuple[np.ndarray, np.ndarray, Tuple[int, ...]]:
-    """Quantize float32 array to Q8_0 (block int8 + fp32 scale)."""
     orig_shape = arr.shape
-    flat = arr.ravel().astype(np.float32)
+    flat = np.ascontiguousarray(arr.ravel(), dtype=np.float32)
     n = flat.shape[0]
-    n_blocks = (n + block_size - 1) // block_size
-    padded = np.zeros(n_blocks * block_size, dtype=np.float32)
-    padded[:n] = flat
+    n_full = n // block_size
+    rem = n % block_size
+    n_blocks = n_full + (1 if rem else 0)
+    padded_n = n_blocks * block_size
 
-    blocks = padded.reshape(n_blocks, block_size)
-    absmax = np.max(np.abs(blocks), axis=1, keepdims=True)
-    absmax = np.where(absmax == 0, 1.0, absmax)
-    scales = (absmax / 127.0).ravel()
-    qdata = np.clip(np.round(blocks / (scales.reshape(n_blocks, 1))), -128, 127).astype(np.int8)
+    qdata = np.empty(padded_n, dtype=np.int8)
+    scales = np.empty(n_blocks, dtype=np.float32)
+
+    if n_full:
+        blocks = flat[:n_full * block_size].reshape(n_full, block_size)
+        absmax = np.max(np.abs(blocks), axis=1)
+        absmax = np.where(absmax == 0, 1.0, absmax)
+        s = absmax / 127.0
+        scales[:n_full] = s
+        qdata[:n_full * block_size] = np.clip(
+            np.round(blocks / s[:, None]), -128, 127
+        ).astype(np.int8).ravel()
+
+    if rem:
+        tail = flat[-rem:]
+        abmax = np.max(np.abs(tail))
+        if abmax == 0:
+            abmax = 1.0
+        s = abmax / 127.0
+        scales[-1] = s
+        block = np.empty(block_size, dtype=np.float32)
+        block[:rem] = tail
+        block[rem:] = 0.0
+        qdata[-block_size:] = np.clip(
+            np.round(block / s), -128, 127
+        ).astype(np.int8)
 
     return qdata, scales, orig_shape
 
