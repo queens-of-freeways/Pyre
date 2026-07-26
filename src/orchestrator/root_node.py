@@ -42,25 +42,22 @@ class _NumpyKernels:
     @staticmethod
     def apply_rope(x, out, theta, start_pos, rope_fraction):
         b, h, s, d = x.shape
-        d_rope = int(d * rope_fraction)
-        if d_rope == 0:
+        dims = int(d * rope_fraction)
+        if dims < 2:
             out[:] = x
             return
-        freqs = np.arange(d_rope // 2, dtype=np.float32) * np.float32(-2.0 / d_rope)
-        freqs = theta ** freqs
-        pos = np.arange(s, dtype=np.float32) + start_pos
-        angles = pos[:, np.newaxis] * freqs[np.newaxis, :]
-        cos_vals = np.cos(angles).reshape(1, 1, s, d_rope)
-        sin_vals = np.sin(angles).reshape(1, 1, s, d_rope)
+        half = dims // 2
         out[:] = x.copy()
-        x_rope = x[..., :d_rope]
-        x_half = int(d_rope) // 2
-        x1 = x_rope[..., :x_half]
-        x2 = x_rope[..., x_half:]
-        cos_v = cos_vals[..., :x_half]
-        sin_v = sin_vals[..., :x_half]
-        rotated = np.concatenate([x1 * cos_v - x2 * sin_v, x2 * cos_v + x1 * sin_v], axis=-1)
-        out[..., :d_rope] = rotated
+        i_vals = np.arange(half, dtype=np.float64)
+        freqs = 1.0 / (theta ** (2.0 * i_vals / dims))
+        pos_vals = np.arange(s, dtype=np.float64) + start_pos
+        angles = np.outer(pos_vals, freqs)
+        cos_vals = np.cos(angles).astype(np.float32).reshape(1, 1, s, half)
+        sin_vals = np.sin(angles).astype(np.float32).reshape(1, 1, s, half)
+        x1 = x[..., :half]
+        x2 = x[..., half:dims]
+        out[..., :half] = x1 * cos_vals - x2 * sin_vals
+        out[..., half:dims] = x1 * sin_vals + x2 * cos_vals
 
     @staticmethod
     def apply_v_norm(v, out):
