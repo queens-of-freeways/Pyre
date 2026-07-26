@@ -74,7 +74,7 @@ class _NumpyKernels:
 
     @staticmethod
     def matmul_f32(a, b, out):
-        np.dot(a, b, out=out)
+        out[:] = a @ b
 
 def _load_mojo_runtime():
     """Pre-load Mojo runtime .so dependencies so dlopen can resolve them.
