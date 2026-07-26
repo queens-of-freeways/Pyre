@@ -81,20 +81,21 @@ class RootNode:
 
         self.worker_conns = []
         self.worker_ids = []
+        self.worker_info = []  # (conn, worker_id, partition, is_local)
 
         # ── Adaptive Partitioning ──────────────────────────────────────
         total_nodes = 1 + len(worker_addrs)
         self.adaptive_partitioner = AdaptivePartitioner(
             config.ffn_dim, total_nodes, seq_len=64,
         )
+
+        # ── Phase 1: Connect to all workers and send shard specs ───────
         for i, (host, port) in enumerate(worker_addrs):
             worker_id = i + 1
             is_local = (local_worker is not None
                         and host == "localhost"
                         and port == local_worker.port)
 
-            # Set injection event before connecting so the worker's init
-            # loop sees it before entering the TCP receive path.
             if is_local:
                 local_worker._local_injection_event = threading.Event()
 
@@ -109,52 +110,25 @@ class RootNode:
             if msg_type != MSG_READY:
                 raise RuntimeError(f"Expected READY from worker {worker_id}, got {msg_type}")
 
-            # Stream layer weights one at a time (never hold all layers in RAM)
-            if weight_provider is not None:
-                print(f"  [worker {worker_id}] starting weight stream for {config.num_layers} layers...", flush=True)
-                t_start = time.time()
-                # Cache quantized layers across workers so worker 2+ reuses worker 1's work
-                if not hasattr(self, '_quantized_layer_cache'):
-                    self._quantized_layer_cache = {}
-                for layer_idx in range(config.num_layers):
-                    t0 = time.time()
-                    if layer_idx in self._quantized_layer_cache:
-                        lw_q = self._quantized_layer_cache[layer_idx]
-                        load_info = "(cached)"
-                    else:
-                        lw = weight_provider._layer_weights_for_node(
-                            layer_idx, p, full_q=True, copy_weights=True,
-                        )
-                        lw_q = quantize_weights_dict(lw)
-                        self._quantized_layer_cache[layer_idx] = lw_q
-                        del lw
-                        load_info = ""
-                    t1 = time.time()
-                    if is_local:
-                        local_worker._compressed[layer_idx] = lw_q
-                    else:
-                        send_msg(conn, MSG_LAYER_WEIGHTS, (layer_idx, lw_q))
-                    t2 = time.time()
-                    if layer_idx % 8 == 0:
-                        gc.collect()
-                    elapsed = time.time() - t_start
-                    print(f"  [worker {worker_id}] layer {layer_idx}: {load_info}send={t2-t1:.1f}s total={elapsed:.0f}s", flush=True)
-                if is_local:
-                    local_worker._local_injection_event.set()
-                print(f"  [worker {worker_id}] weight streaming done in {time.time()-t_start:.1f}s", flush=True)
-            elif all_layer_weights and worker_id in all_layer_weights:
-                # Fallback: batch send (pre-computed weights)
-                wl = all_layer_weights[worker_id]
+            self.worker_conns.append(conn)
+            self.worker_ids.append(worker_id)
+            self.worker_info.append((conn, worker_id, p, is_local))
+
+        # ── Phase 2: Stream weights in parallel ────────────────────────
+        if weight_provider is not None:
+            self._stream_all_weights_parallel(
+                weight_provider, config.num_layers, local_worker,
+            )
+        elif all_layer_weights:
+            # Fallback: batch send (pre-computed weights)
+            for conn, worker_id, p, is_local in self.worker_info:
+                wl = all_layer_weights.get(worker_id, {})
                 worker_data = {"weights": {k: v for k, v in wl.items()}}
                 for lidx, lw in wl.items():
                     lp = lw.get("_props", {})
                     worker_data.setdefault("props", {})[lidx] = lp
                 worker_data_q = quantize_weights_dict(worker_data)
                 send_msg(conn, MSG_INIT_WEIGHTS, worker_data_q)
-                del worker_data, worker_data_q, all_layer_weights[worker_id]
-
-            self.worker_conns.append(conn)
-            self.worker_ids.append(worker_id)
 
     def _solve_partitions(self, n):
         ffn_dim = self.config.ffn_dim
@@ -186,6 +160,76 @@ class RootNode:
                     time.sleep(delay)
                 else:
                     raise
+
+    def _stream_all_weights_parallel(self, weight_provider, num_layers, local_worker):
+        """Stream quantized weights to all workers in parallel threads.
+
+        Attention weights (identical across workers with full_q=True) are
+        pre-cached so each worker thread only loads+quantizes FFN weights
+        per layer, then splices with the cached attention payload.
+        """
+        p0 = self.partitions[0]  # use root's partition for attn (full_q ignores ffn slice)
+        attn_cache = {}
+
+        # Pre-cache attention weights (one sequential pass — shared across workers)
+        print(f"  pre-caching attention weights for {num_layers} layers...", flush=True)
+        t0 = time.time()
+        for layer_idx in range(num_layers):
+            lw = weight_provider._layer_weights_for_node(
+                layer_idx, p0, full_q=True, copy_weights=True,
+            )
+            # Extract and quantize attention weights, keep FFN ref for later
+            attn_q = quantize_weights_dict({"attn": lw["attn"], "_props": lw["_props"],
+                                            "input_layernorm": lw.get("input_layernorm"),
+                                            "post_attention_layernorm": lw.get("post_attention_layernorm")})
+            attn_cache[layer_idx] = attn_q
+            # Keep the un-quantized FFN reference for this layer (partition 0's FFN)
+            # Worker threads will reload FFN for their own partition
+            del lw
+            if layer_idx % 8 == 0:
+                gc.collect()
+        print(f"  attention cache built in {time.time()-t0:.1f}s", flush=True)
+
+        def stream_worker(conn, worker_id, p, is_local):
+            t_start = time.time()
+            print(f"  [worker {worker_id}] streaming {num_layers} layers...", flush=True)
+            for layer_idx in range(num_layers):
+                t0 = time.time()
+                # Load FFN weights for this worker's partition
+                lw = weight_provider._layer_weights_for_node(
+                    layer_idx, p, full_q=True, copy_weights=True,
+                )
+                # Quantize just the FFN portion
+                ffn_q = quantize_weights_dict({"ffn": lw["ffn"]})
+                # Build full payload: cached attn + fresh FFN
+                payload = dict(attn_cache[layer_idx])
+                payload["ffn"] = ffn_q["ffn"]
+                t1 = time.time()
+
+                if is_local:
+                    local_worker._compressed[layer_idx] = payload
+                else:
+                    send_msg(conn, MSG_LAYER_WEIGHTS, (layer_idx, payload))
+                del lw, ffn_q, payload
+                if layer_idx % 8 == 0:
+                    gc.collect()
+                elapsed = time.time() - t_start
+                print(f"  [worker {worker_id}] layer {layer_idx}: load_ffn={t1-t0:.1f}s send={time.time()-t1:.1f}s total={elapsed:.0f}s", flush=True)
+            if is_local:
+                local_worker._local_injection_event.set()
+            print(f"  [worker {worker_id}] weight stream done in {time.time()-t_start:.1f}s", flush=True)
+
+        threads = []
+        for conn, worker_id, p, is_local in self.worker_info:
+            t = threading.Thread(
+                target=stream_worker,
+                args=(conn, worker_id, p, is_local),
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
 
     @staticmethod
     def _softmax(x, axis=-1):
