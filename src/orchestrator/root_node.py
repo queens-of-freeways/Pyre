@@ -26,6 +26,59 @@ from src.orchestrator.quantizer import quantize_weights_dict
 
 _PYRE_KERNELS = None
 
+class _NumpyKernels:
+    """Pure-numpy fallback when the Mojo kernel .so cannot be loaded."""
+    @staticmethod
+    def rms_norm(x, weight, out):
+        variance = np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True)
+        out[:] = (x / np.sqrt(variance + 1e-6) * weight).astype(np.float32)
+
+    @staticmethod
+    def softmax(x, out):
+        x_max = x.max(axis=-1, keepdims=True)
+        e_x = np.exp((x - x_max).astype(np.float64))
+        out[:] = (e_x / e_x.sum(axis=-1, keepdims=True)).astype(np.float32)
+
+    @staticmethod
+    def apply_rope(x, out, theta, start_pos, rope_fraction):
+        b, h, s, d = x.shape
+        d_rope = int(d * rope_fraction)
+        if d_rope == 0:
+            out[:] = x
+            return
+        freqs = np.arange(d_rope // 2, dtype=np.float32) * np.float32(-2.0 / d_rope)
+        freqs = theta ** freqs
+        pos = np.arange(s, dtype=np.float32) + start_pos
+        angles = pos[:, np.newaxis] * freqs[np.newaxis, :]
+        cos_vals = np.cos(angles).reshape(1, 1, s, d_rope)
+        sin_vals = np.sin(angles).reshape(1, 1, s, d_rope)
+        out[:] = x.copy()
+        x_rope = x[..., :d_rope]
+        x_half = int(d_rope) // 2
+        x1 = x_rope[..., :x_half]
+        x2 = x_rope[..., x_half:]
+        cos_v = cos_vals[..., :x_half]
+        sin_v = sin_vals[..., :x_half]
+        rotated = np.concatenate([x1 * cos_v - x2 * sin_v, x2 * cos_v + x1 * sin_v], axis=-1)
+        out[..., :d_rope] = rotated
+
+    @staticmethod
+    def apply_v_norm(v, out):
+        mean_sq = np.mean(v.astype(np.float64) ** 2, axis=-1, keepdims=True)
+        out[:] = (v / np.sqrt(mean_sq + 1e-6)).astype(np.float32)
+
+    @staticmethod
+    def gelu(x, out):
+        out[:] = (0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x ** 3)))).astype(np.float32)
+
+    @staticmethod
+    def silu_mul(gate, up, out):
+        out[:] = (gate / (1 + np.exp(-gate)) * up).astype(np.float32)
+
+    @staticmethod
+    def matmul_f32(a, b, out):
+        np.dot(a, b, out=out)
+
 def _load_mojo_runtime():
     """Pre-load Mojo runtime .so dependencies so dlopen can resolve them.
 
@@ -56,15 +109,18 @@ def _get_pyre_kernels():
     global _PYRE_KERNELS
     if _PYRE_KERNELS is None:
         import sys, os
-        _load_mojo_runtime()
-        _kernels_dir = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'kernels',
-        )
-        if _kernels_dir not in sys.path:
-            sys.path.insert(0, _kernels_dir)
-        import pyre_kernels as _pk
-        _PYRE_KERNELS = _pk
+        try:
+            _load_mojo_runtime()
+            _kernels_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'kernels',
+            )
+            if _kernels_dir not in sys.path:
+                sys.path.insert(0, _kernels_dir)
+            import pyre_kernels as _pk
+            _PYRE_KERNELS = _pk
+        except ImportError:
+            _PYRE_KERNELS = _NumpyKernels
     return _PYRE_KERNELS
 
 
