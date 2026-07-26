@@ -26,35 +26,22 @@ from src.orchestrator.quantizer import quantize_weights_dict
 
 _PYRE_KERNELS = None
 
-def _ensure_pixi_lib():
-    """Help the dynamic linker find Mojo runtime .so dependencies."""
-    import os, ctypes
-    pixi_root = os.environ.get('PIXI_PROJECT_ROOT')
-    if not pixi_root:
-        return
-    lib_dir = os.path.join(pixi_root, '.pixi', 'envs', 'default', 'lib')
-    if not os.path.isdir(lib_dir):
-        return
-    deps = [
-        'libAsyncRTMojoBindings.so',
-        'libAsyncRTRuntimeGlobals.so',
-        'libKGENCompilerRTShared.so',
-        'libMSupportGlobals.so',
-        'libNVPTX.so',
-    ]
-    for dep in deps:
-        dep_path = os.path.join(lib_dir, dep)
-        if os.path.exists(dep_path):
-            try:
-                ctypes.CDLL(dep_path, mode=ctypes.RTLD_GLOBAL)
-            except OSError:
-                pass
-
 def _get_pyre_kernels():
     global _PYRE_KERNELS
     if _PYRE_KERNELS is None:
         import sys, os
-        _ensure_pixi_lib()
+
+        # The .so was compiled with an absolute RUNPATH pointing to the build
+        # machine's pixi lib dir. Set LD_LIBRARY_PATH so dlopen can find the
+        # Mojo runtime dependencies on any machine.
+        pixi_root = os.environ.get('PIXI_PROJECT_ROOT')
+        if pixi_root:
+            lib_dir = os.path.join(pixi_root, '.pixi', 'envs', 'default', 'lib')
+            if os.path.isdir(lib_dir):
+                existing = os.environ.get('LD_LIBRARY_PATH', '')
+                if lib_dir not in existing:
+                    os.environ['LD_LIBRARY_PATH'] = lib_dir + (':' + existing if existing else '')
+
         _kernels_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'kernels')
         if _kernels_dir not in sys.path:
             sys.path.insert(0, _kernels_dir)
