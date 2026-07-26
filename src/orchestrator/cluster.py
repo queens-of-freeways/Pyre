@@ -52,7 +52,12 @@ class ModelConfig:
         # "text_config" — fall back to that when top-level lookups return None.
         tc = getattr(cfg, "text_config", cfg)
 
-        hidden_dim = getattr(cfg, "hidden_size", getattr(cfg, "hidden_dim", None))
+        hidden_dim = (
+            getattr(cfg, "hidden_size", None)
+            or getattr(cfg, "hidden_dim", None)
+            or getattr(tc, "hidden_size", None)
+            or getattr(tc, "hidden_dim", None)
+        )
         n_heads = (
             getattr(cfg, "num_attention_heads", None)
             or getattr(cfg, "num_heads", None)
