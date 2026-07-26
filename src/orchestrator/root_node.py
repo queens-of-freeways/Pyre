@@ -55,7 +55,7 @@ def _load_mojo_runtime():
 def _get_pyre_kernels():
     global _PYRE_KERNELS
     if _PYRE_KERNELS is None:
-        import sys
+        import sys, os
         _load_mojo_runtime()
         _kernels_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
