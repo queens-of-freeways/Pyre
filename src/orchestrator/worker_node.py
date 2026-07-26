@@ -130,155 +130,164 @@ class WorkerNode:
                     print(f"Warning: mDNS registration failed: {e}")
             print(f"Worker listening on {self.host}:{self.port}")
 
-            conn, addr = server.accept()
-            conn.settimeout(600.0)
-
-            msg_type, obj = recv_msg(conn)
-            if msg_type != MSG_SHARD_SPEC:
-                raise ValueError(f"Expected SHARD_SPEC, got {msg_type}")
-
-            shard_spec, model_config = obj
-            self.shard = shard_spec
-            self.config = model_config
-            self.local_seq_len = shard_spec.local_seq_len()
-            self.hidden_dim = model_config.hidden_dim
-
-            full_seq_len = 64
-            self.ffn_model = self.session.load(build_ffn_graph(
-                shard_spec, model_config.hidden_dim, self.device,
-                seq_len=full_seq_len, gated=True,
-            ))
-            self.ffn_decode_model = self.session.load(build_ffn_graph(
-                shard_spec, model_config.hidden_dim, self.device,
-                seq_len=1, gated=True,
-            ))
-
-            send_msg(conn, MSG_READY)
-
-            # Check if weights were pre-injected by a local in-process root.
-            self._compressed = {}
-            self._dequantized = {}
-            self.layer_weights = {}  # backward-compat alias — kept as live ref
-            self.layer_props = {}
-            if self._local_injection_event is not None:
-                self._local_injection_event.wait()
-                # All layers already injected into _compressed by RootNode
-                self.layer_props = {
-                    lidx: lw.get("_props", {})
-                    for lidx, lw in self._compressed.items()
-                }
-            else:
-                # Normal TCP streaming from remote root
-                num_layers = self.config.num_layers
-                for layer_idx in range(num_layers):
-                    msg_type, payload = recv_msg(conn)
-                    if msg_type == MSG_LAYER_WEIGHTS:
-                        lidx, layer_payload = payload
-                    elif msg_type == MSG_INIT_WEIGHTS:
-                        # Fallback: batch receive all layers at once
-                        layer_payload = payload
-                        if isinstance(layer_payload, dict):
-                            layer_payload = dequantize_weights_dict(layer_payload)
-                        for w_lidx, w_payload in layer_payload.get("weights", {}).items():
-                            self._compressed[w_lidx] = w_payload
-                        self.layer_props = layer_payload.get("props", {})
-                        break
-                    else:
-                        raise ValueError(
-                            f"Expected LAYER_WEIGHTS ({MSG_LAYER_WEIGHTS}) "
-                            f"or INIT_WEIGHTS ({MSG_INIT_WEIGHTS}), got {msg_type}"
-                        )
-
-                    self._compressed[lidx] = layer_payload
-                    self.layer_props[lidx] = layer_payload.get("_props", {})
-
-            needed_hds = set()
-            for lp in self.layer_props.values():
-                needed_hds.add(lp.get("head_dim", model_config.head_dim))
-            if not needed_hds:
-                needed_hds.add(model_config.head_dim)
-
-            for hd in needed_hds:
-                self.attn_models[hd] = self._compile_attention(hd)
-
+            # Accept connections in a loop so stray probes don't kill the worker
             while True:
-                msg_type, data = recv_msg(conn)
-                if msg_type == MSG_SHUTDOWN:
-                    break
-                if msg_type == MSG_FORWARD_DATA:
-                    layer_idx, x_slice = data
-                    lw = self._get_dequantized(layer_idx)
-                    lp = self.layer_props.get(layer_idx, {})
-                    hd = lp.get("head_dim", self.config.head_dim)
-                    aw = lw["attn"]
-                    fw = lw["ffn"]
-                    self._current_ffn_gate = fw["gate"]
-                    self._current_ffn_up = fw["up"]
-                    self._current_ffn_down = fw["down"]
+                conn, addr = server.accept()
+                conn.settimeout(600.0)
+                print(f"Accepted connection from {addr}", flush=True)
+                try:
+                    msg_type, obj = recv_msg(conn)
+                    if msg_type != MSG_SHARD_SPEC:
+                        print(f"Expected SHARD_SPEC, got {msg_type} — ignoring", flush=True)
+                        conn.close()
+                        continue
 
-                    attn_model = self.attn_models.get(hd)
-                    if attn_model is None:
-                        attn_model = list(self.attn_models.values())[0]
+                    shard_spec, model_config = obj
+                    self.shard = shard_spec
+                    self.config = model_config
+                    self.local_seq_len = shard_spec.local_seq_len()
+                    self.hidden_dim = model_config.hidden_dim
 
-                    v_arr = aw.get("v")
-                    if v_arr is None:
-                        v_arr = aw["k"]
-                    (q, k, v) = attn_model.execute(
-                        np.ascontiguousarray(x_slice),
-                        np.ascontiguousarray(aw["q"]),
-                        np.ascontiguousarray(aw["k"]),
-                        np.ascontiguousarray(v_arr),
-                    )
+                    full_seq_len = 64
+                    self.ffn_model = self.session.load(build_ffn_graph(
+                        shard_spec, model_config.hidden_dim, self.device,
+                        seq_len=full_seq_len, gated=True,
+                    ))
+                    self.ffn_decode_model = self.session.load(build_ffn_graph(
+                        shard_spec, model_config.hidden_dim, self.device,
+                        seq_len=1, gated=True,
+                    ))
 
-                    send_msg(
-                        conn, MSG_FORWARD_RESULT,
-                        (q.to_numpy(), k.to_numpy(), v.to_numpy()),
-                    )
-                    self._free_dequantized(layer_idx)
-                elif msg_type == MSG_ATTN_OUTPUT:
-                    (h_norm_full,) = data
-                    (partial,) = self.ffn_model.execute(
-                        np.ascontiguousarray(h_norm_full),
-                        np.ascontiguousarray(self._current_ffn_gate),
-                        np.ascontiguousarray(self._current_ffn_up),
-                        np.ascontiguousarray(self._current_ffn_down),
-                    )
-                    self._current_ffn_gate = None
-                    self._current_ffn_up = None
-                    self._current_ffn_down = None
-                    send_msg(conn, MSG_FFN_RESULT, partial.to_numpy())
-                elif msg_type == MSG_DECODE_STEP:
-                    layer_idx, h_norm = data
-                    cw = self._compressed.get(layer_idx)
-                    if cw is None:
-                        fw = self._get_fallback_weights(layer_idx)["ffn"]
+                    send_msg(conn, MSG_READY)
+
+                    # Check if weights were pre-injected by a local in-process root.
+                    self._compressed = {}
+                    self._dequantized = {}
+                    self.layer_weights = {}  # backward-compat alias — kept as live ref
+                    self.layer_props = {}
+                    if self._local_injection_event is not None:
+                        self._local_injection_event.wait()
+                        # All layers already injected into _compressed by RootNode
+                        self.layer_props = {
+                            lidx: lw.get("_props", {})
+                            for lidx, lw in self._compressed.items()
+                        }
                     else:
-                        ffn_q = cw.get("ffn", {})
-                        if isinstance(ffn_q, dict) and any(
-                            isinstance(v, tuple) and v[0] == "q8"
-                            for v in ffn_q.values() if isinstance(v, tuple)
-                        ):
-                            fw = dequantize_weights_dict(ffn_q)
-                        else:
-                            fw = ffn_q
-                    (partial,) = self.ffn_decode_model.execute(
-                        np.ascontiguousarray(h_norm),
-                        np.ascontiguousarray(fw["gate"]),
-                        np.ascontiguousarray(fw["up"]),
-                        np.ascontiguousarray(fw["down"]),
-                    )
-                    send_msg(conn, MSG_FFN_RESULT, partial.to_numpy())
-                elif msg_type == MSG_ALL_LAYERS_DONE:
-                    pass
+                        # Normal TCP streaming from remote root
+                        num_layers = self.config.num_layers
+                        for layer_idx in range(num_layers):
+                            msg_type, payload = recv_msg(conn)
+                            if msg_type == MSG_LAYER_WEIGHTS:
+                                lidx, layer_payload = payload
+                            elif msg_type == MSG_INIT_WEIGHTS:
+                                # Fallback: batch receive all layers at once
+                                layer_payload = payload
+                                if isinstance(layer_payload, dict):
+                                    layer_payload = dequantize_weights_dict(layer_payload)
+                                for w_lidx, w_payload in layer_payload.get("weights", {}).items():
+                                    self._compressed[w_lidx] = w_payload
+                                self.layer_props = layer_payload.get("props", {})
+                                break
+                            else:
+                                print(f"Unexpected msg type {msg_type} during weight stream — ignoring", flush=True)
+                                conn.close()
+                                break
 
-        except Exception as e:
+                            self._compressed[lidx] = layer_payload
+                            self.layer_props[lidx] = layer_payload.get("_props", {})
+
+                    needed_hds = set()
+                    for lp in self.layer_props.values():
+                        needed_hds.add(lp.get("head_dim", model_config.head_dim))
+                    if not needed_hds:
+                        needed_hds.add(model_config.head_dim)
+
+                    for hd in needed_hds:
+                        self.attn_models[hd] = self._compile_attention(hd)
+
+                    while True:
+                        msg_type, data = recv_msg(conn)
+                        if msg_type == MSG_SHUTDOWN:
+                            break
+                        if msg_type == MSG_FORWARD_DATA:
+                            layer_idx, x_slice = data
+                            lw = self._get_dequantized(layer_idx)
+                            lp = self.layer_props.get(layer_idx, {})
+                            hd = lp.get("head_dim", self.config.head_dim)
+                            aw = lw["attn"]
+                            fw = lw["ffn"]
+                            self._current_ffn_gate = fw["gate"]
+                            self._current_ffn_up = fw["up"]
+                            self._current_ffn_down = fw["down"]
+
+                            attn_model = self.attn_models.get(hd)
+                            if attn_model is None:
+                                attn_model = list(self.attn_models.values())[0]
+
+                            v_arr = aw.get("v")
+                            if v_arr is None:
+                                v_arr = aw["k"]
+                            (q, k, v) = attn_model.execute(
+                                np.ascontiguousarray(x_slice),
+                                np.ascontiguousarray(aw["q"]),
+                                np.ascontiguousarray(aw["k"]),
+                                np.ascontiguousarray(v_arr),
+                            )
+
+                            send_msg(
+                                conn, MSG_FORWARD_RESULT,
+                                (q.to_numpy(), k.to_numpy(), v.to_numpy()),
+                            )
+                            self._free_dequantized(layer_idx)
+                        elif msg_type == MSG_ATTN_OUTPUT:
+                            (h_norm_full,) = data
+                            (partial,) = self.ffn_model.execute(
+                                np.ascontiguousarray(h_norm_full),
+                                np.ascontiguousarray(self._current_ffn_gate),
+                                np.ascontiguousarray(self._current_ffn_up),
+                                np.ascontiguousarray(self._current_ffn_down),
+                            )
+                            self._current_ffn_gate = None
+                            self._current_ffn_up = None
+                            self._current_ffn_down = None
+                            send_msg(conn, MSG_FFN_RESULT, partial.to_numpy())
+                        elif msg_type == MSG_DECODE_STEP:
+                            layer_idx, h_norm = data
+                            cw = self._compressed.get(layer_idx)
+                            if cw is None:
+                                fw = self._get_fallback_weights(layer_idx)["ffn"]
+                            else:
+                                ffn_q = cw.get("ffn", {})
+                                if isinstance(ffn_q, dict) and any(
+                                    isinstance(v, tuple) and v[0] == "q8"
+                                    for v in ffn_q.values() if isinstance(v, tuple)
+                                ):
+                                    fw = dequantize_weights_dict(ffn_q)
+                                else:
+                                    fw = ffn_q
+                            (partial,) = self.ffn_decode_model.execute(
+                                np.ascontiguousarray(h_norm),
+                                np.ascontiguousarray(fw["gate"]),
+                                np.ascontiguousarray(fw["up"]),
+                                np.ascontiguousarray(fw["down"]),
+                            )
+                            send_msg(conn, MSG_FFN_RESULT, partial.to_numpy())
+                        elif msg_type == MSG_ALL_LAYERS_DONE:
+                            pass
+                except (ConnectionError, BrokenPipeError, EOFError, OSError):
+                    print(f"Connection lost from {addr}, waiting for new connection...", flush=True)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        except Exception:
             import traceback
             traceback.print_exc()
         finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
             try:
                 server.close()
             except Exception:

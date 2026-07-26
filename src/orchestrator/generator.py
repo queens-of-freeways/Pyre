@@ -4,6 +4,7 @@ import argparse
 import os
 import sys
 import threading
+import time
 from typing import List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -186,6 +187,9 @@ def _build_gen(
 
     wp = WeightProvider(model, partitions, num_layers=num_layers, use_cache=not reload)
 
+    print(f"[_build_gen] WeightProvider ready, creating RootNode with {len(worker_addrs)} workers...", flush=True)
+    t0 = time.time()
+
     has_ple = wp.ple_dim > 0
     root = RootNode(
         worker_addrs, config,
@@ -195,6 +199,8 @@ def _build_gen(
         ple_projection_norm=wp.get_ple_projection_norm() if has_ple else None,
         local_worker=local_worker,
     )
+
+    print(f"[_build_gen] RootNode ready in {time.time()-t0:.1f}s, loading tokenizer...", flush=True)
 
     tokenizer = AutoTokenizer.from_pretrained(model)
     if tokenizer.pad_token is None:
