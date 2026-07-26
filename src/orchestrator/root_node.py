@@ -153,7 +153,7 @@ class RootNode:
         for attempt in range(max_retries):
             try:
                 conn = socket.create_connection((host, port), timeout=10)
-                conn.settimeout(120.0)
+                conn.settimeout(600.0)
                 return conn
             except ConnectionRefusedError:
                 if attempt < max_retries - 1:
@@ -164,57 +164,27 @@ class RootNode:
     def _stream_all_weights_parallel(self, weight_provider, num_layers, local_worker):
         """Stream quantized weights to all workers in parallel threads.
 
-        Attention weights (identical across workers with full_q=True) are
-        pre-cached so each worker thread only loads+quantizes FFN weights
-        per layer, then splices with the cached attention payload.
+        Each thread independently loads, quantizes, and sends its worker's
+        weights.  No pre-cache phase so there is no idle gap between the
+        shard-spec handshake and the first weight send.
         """
-        p0 = self.partitions[0]  # use root's partition for attn (full_q ignores ffn slice)
-        attn_cache = {}
-
-        # Pre-cache attention weights (one sequential pass — shared across workers)
-        print(f"  pre-caching attention weights for {num_layers} layers...", flush=True)
-        t0 = time.time()
-        for layer_idx in range(num_layers):
-            lw = weight_provider._layer_weights_for_node(
-                layer_idx, p0, full_q=True, copy_weights=True,
-            )
-            # Extract and quantize attention weights, keep FFN ref for later
-            attn_q = quantize_weights_dict({"attn": lw["attn"], "_props": lw["_props"],
-                                            "input_layernorm": lw.get("input_layernorm"),
-                                            "post_attention_layernorm": lw.get("post_attention_layernorm")})
-            attn_cache[layer_idx] = attn_q
-            # Keep the un-quantized FFN reference for this layer (partition 0's FFN)
-            # Worker threads will reload FFN for their own partition
-            del lw
-            if layer_idx % 8 == 0:
-                gc.collect()
-        print(f"  attention cache built in {time.time()-t0:.1f}s", flush=True)
-
         def stream_worker(conn, worker_id, p, is_local):
             t_start = time.time()
             print(f"  [worker {worker_id}] streaming {num_layers} layers...", flush=True)
             for layer_idx in range(num_layers):
-                t0 = time.time()
-                # Load FFN weights for this worker's partition
                 lw = weight_provider._layer_weights_for_node(
                     layer_idx, p, full_q=True, copy_weights=True,
                 )
-                # Quantize just the FFN portion
-                ffn_q = quantize_weights_dict({"ffn": lw["ffn"]})
-                # Build full payload: cached attn + fresh FFN
-                payload = dict(attn_cache[layer_idx])
-                payload["ffn"] = ffn_q["ffn"]
-                t1 = time.time()
-
+                lw_q = quantize_weights_dict(lw)
                 if is_local:
-                    local_worker._compressed[layer_idx] = payload
+                    local_worker._compressed[layer_idx] = lw_q
                 else:
-                    send_msg(conn, MSG_LAYER_WEIGHTS, (layer_idx, payload))
-                del lw, ffn_q, payload
+                    send_msg(conn, MSG_LAYER_WEIGHTS, (layer_idx, lw_q))
+                del lw, lw_q
                 if layer_idx % 8 == 0:
                     gc.collect()
                 elapsed = time.time() - t_start
-                print(f"  [worker {worker_id}] layer {layer_idx}: load_ffn={t1-t0:.1f}s send={time.time()-t1:.1f}s total={elapsed:.0f}s", flush=True)
+                print(f"  [worker {worker_id}] layer {layer_idx}: {elapsed:.0f}s", flush=True)
             if is_local:
                 local_worker._local_injection_event.set()
             print(f"  [worker {worker_id}] weight stream done in {time.time()-t_start:.1f}s", flush=True)
