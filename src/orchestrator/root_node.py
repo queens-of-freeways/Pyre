@@ -26,98 +26,61 @@ from src.orchestrator.quantizer import quantize_weights_dict
 
 _PYRE_KERNELS = None
 
-class _NumpyKernels:
-    """Pure-numpy fallback when the Mojo kernel .so cannot be loaded."""
-    @staticmethod
-    def rms_norm(x, weight, out):
-        variance = np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True)
-        out[:] = (x / np.sqrt(variance + 1e-6) * weight).astype(np.float32)
+def _arch_suffix():
+    import platform
+    m = platform.machine()
+    return {"AMD64": "x86_64", "x86_64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}.get(m, m)
 
-    @staticmethod
-    def softmax(x, out):
-        x_max = x.max(axis=-1, keepdims=True)
-        e_x = np.exp((x - x_max).astype(np.float64))
-        out[:] = (e_x / e_x.sum(axis=-1, keepdims=True)).astype(np.float32)
-
-    @staticmethod
-    def apply_rope(x, out, theta, start_pos, rope_fraction):
-        b, h, s, d = x.shape
-        dims = int(d * rope_fraction)
-        if dims < 2:
-            out[:] = x
-            return
-        half = dims // 2
-        out[:] = x.copy()
-        i_vals = np.arange(half, dtype=np.float64)
-        freqs = 1.0 / (theta ** (2.0 * i_vals / dims))
-        pos_vals = np.arange(s, dtype=np.float64) + start_pos
-        angles = np.outer(pos_vals, freqs)
-        cos_vals = np.cos(angles).astype(np.float32).reshape(1, 1, s, half)
-        sin_vals = np.sin(angles).astype(np.float32).reshape(1, 1, s, half)
-        x1 = x[..., :half]
-        x2 = x[..., half:dims]
-        out[..., :half] = x1 * cos_vals - x2 * sin_vals
-        out[..., half:dims] = x1 * sin_vals + x2 * cos_vals
-
-    @staticmethod
-    def apply_v_norm(v, out):
-        mean_sq = np.mean(v.astype(np.float64) ** 2, axis=-1, keepdims=True)
-        out[:] = (v / np.sqrt(mean_sq + 1e-6)).astype(np.float32)
-
-    @staticmethod
-    def gelu(x, out):
-        out[:] = (0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x ** 3)))).astype(np.float32)
-
-    @staticmethod
-    def silu_mul(gate, up, out):
-        out[:] = (gate / (1 + np.exp(-gate)) * up).astype(np.float32)
-
-    @staticmethod
-    def matmul_f32(a, b, out):
-        out[:] = a @ b
-
-def _load_mojo_runtime():
-    """Pre-load Mojo runtime .so dependencies so dlopen can resolve them.
-
-    pyre_kernels.so was compiled with an absolute RUNPATH pointing to the
-    build machine's pixi lib directory.  On other machines that path won't
-    exist, so we load the dependencies ourselves with RTLD_GLOBAL to make
-    their symbols available to the subsequent Python import.
-    """
-    import os, ctypes
-    pixi_root = os.environ.get('PIXI_PROJECT_ROOT')
-    if not pixi_root:
-        return
-    lib_dir = os.path.join(pixi_root, '.pixi', 'envs', 'default', 'lib')
-    if not os.path.isdir(lib_dir):
-        return
-    # Order matters: leaf dependencies first.
-    for dep in ('libMSupportGlobals.so', 'libKGENCompilerRTShared.so',
-                'libNVPTX.so', 'libAsyncRTRuntimeGlobals.so',
-                'libAsyncRTMojoBindings.so'):
-        path = os.path.join(lib_dir, dep)
-        if os.path.exists(path):
-            try:
-                ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
-            except OSError:
-                pass
+def _project_root():
+    import os
+    d = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return d  # .../distributed-llama-mojo
 
 def _get_pyre_kernels():
     global _PYRE_KERNELS
-    if _PYRE_KERNELS is None:
-        import sys, os
-        try:
-            _load_mojo_runtime()
-            _kernels_dir = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                'kernels',
-            )
-            if _kernels_dir not in sys.path:
-                sys.path.insert(0, _kernels_dir)
-            import pyre_kernels as _pk
-            _PYRE_KERNELS = _pk
-        except ImportError:
-            _PYRE_KERNELS = _NumpyKernels
+    if _PYRE_KERNELS is not None:
+        return _PYRE_KERNELS
+    import os, sys, subprocess, importlib.util
+    root = _project_root()
+    kernels_dir = os.path.join(root, 'src', 'kernels')
+    arch = _arch_suffix()
+    so_name = f'pyre_kernels_{arch}.so'
+    so_path = os.path.join(kernels_dir, so_name)
+    if os.path.isfile(so_path):
+        spec = importlib.util.spec_from_file_location("pyre_kernels", so_path)
+        if spec is not None:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            sys.modules["pyre_kernels"] = mod
+            _PYRE_KERNELS = mod
+            return _PYRE_KERNELS
+    # Not found — try to compile from source.
+    mojo_src = os.path.join(kernels_dir, 'mojo', 'pyre_kernels.mojo')
+    if not os.path.isfile(mojo_src):
+        raise ImportError(
+            f"Mojo kernel .so not found for arch '{arch}' and source "
+            f"missing at {mojo_src}. Cannot run without compiled kernels."
+        )
+    print(f"[pyre] Compiling Mojo kernels for {arch}...")
+    ret = subprocess.run(
+        ["mojo", "build", "--emit", "shared-lib", "-I", root,
+         "-o", so_path, mojo_src],
+        capture_output=True, text=True,
+    )
+    if ret.returncode != 0:
+        raise ImportError(
+            f"Mojo compilation failed (exit {ret.returncode}):\n"
+            f"{ret.stderr.strip()}"
+        )
+    if not os.path.isfile(so_path):
+        raise ImportError("Mojo compilation succeeded but output .so not found.")
+    spec = importlib.util.spec_from_file_location("pyre_kernels", so_path)
+    if spec is None:
+        raise ImportError(f"Could not create module spec for {so_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    sys.modules["pyre_kernels"] = mod
+    _PYRE_KERNELS = mod
     return _PYRE_KERNELS
 
 
