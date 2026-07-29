@@ -40,27 +40,42 @@ def dequantize_q80(qdata: np.ndarray, scales: np.ndarray,
     return np.ascontiguousarray(result[:total].reshape(orig_shape))
 
 
-def quantize_weights_dict(weights: dict) -> dict:
-    """Recursively quantize all numpy arrays in a weight dict. Flags unsafe=False for pickle."""
+def quantize_to_f16(arr: np.ndarray) -> tuple:
+    """Store float32 as float16 (2x compression, negligible precision loss)."""
+    return ("f16", arr.astype(np.float16), arr.shape)
+
+
+def dequantize_from_f16(data: tuple) -> np.ndarray:
+    """Restore float16 back to float32."""
+    _, arr, shape = data
+    return np.ascontiguousarray(arr.astype(np.float32).reshape(shape))
+
+
+def quantize_weights_dict(weights: dict, mode: str = "q8") -> dict:
+    """Recursively quantize all numpy arrays in a weight dict.
+
+    mode: "q8" for 4x compression (block int8), "f16" for 2x (float16).
+    """
     qd = {}
     for k, v in weights.items():
         if isinstance(v, dict):
-            qd[k] = quantize_weights_dict(v)
+            qd[k] = quantize_weights_dict(v, mode=mode)
         elif isinstance(v, np.ndarray) and v.size >= MIN_QUANTIZE_ELEMS:
-            q, s, sh = quantize_q80(v)
-            qd[k] = ("q8", q, s, sh)
+            if mode == "f16":
+                qd[k] = quantize_to_f16(v)
+            else:
+                q, s, sh = quantize_q80(v)
+                qd[k] = ("q8", q, s, sh)
         else:
             qd[k] = v
     return qd
 
 
 def dequantize_weights_dict(qd: dict, subset: str = "") -> dict:
-    """Recursively dequantize all Q8_0 entries in a dict.
+    """Recursively dequantize all quantized entries in a dict.
 
     If *subset* is set to a top-level key (e.g. ``"ffn"``), only that
     subtree is dequantized; all other top-level keys are returned as-is.
-    This avoids decompressing attention weights when only FFN is needed
-    (decode steps).
     """
     result = {}
     for k, v in qd.items():
@@ -69,9 +84,15 @@ def dequantize_weights_dict(qd: dict, subset: str = "") -> dict:
             continue
         if isinstance(v, dict):
             result[k] = dequantize_weights_dict(v)
-        elif isinstance(v, tuple) and v[0] == "q8":
-            _, q, s, sh = v
-            result[k] = dequantize_q80(q, s, sh)
+        elif isinstance(v, tuple):
+            tag = v[0]
+            if tag == "q8":
+                _, q, s, sh = v
+                result[k] = dequantize_q80(q, s, sh)
+            elif tag == "f16":
+                result[k] = dequantize_from_f16(v)
+            else:
+                result[k] = v
         else:
             result[k] = v
     return result

@@ -841,8 +841,10 @@ class RootNode:
                 raw = self._wp._layer_weights_for_node(
                     layer_idx, self.partitions[0], full_q=True, copy_weights=True,
                 )
+                # Quantize FFN only (~88% of weight memory), keep attention float32
+                raw["ffn"] = quantize_weights_dict(raw.get("ffn", {}), mode="f16")
                 self._weight_cache[layer_idx] = raw
-            return self._weight_cache[layer_idx]
+            return dequantize_weights_dict(self._weight_cache[layer_idx])
         if self.all_layer_weights and 0 in self.all_layer_weights:
             return self.all_layer_weights[0].get(layer_idx, {})
         return {}
