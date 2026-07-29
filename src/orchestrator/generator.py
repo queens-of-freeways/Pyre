@@ -57,8 +57,8 @@ class Generator:
         probs = exp_l / np.sum(exp_l, axis=-1, keepdims=True)
         return np.array([[np.random.choice(probs.shape[-1], p=probs[0])]])
 
-    def generate(self, prompt: str, max_tokens: Optional[int] = None, stream: bool = False, temperature: float = 0.7) -> str:
-        if hasattr(self.tokenizer, "apply_chat_template") and not prompt.startswith("<|"):
+    def generate(self, prompt: str, max_tokens: Optional[int] = None, stream: bool = False, temperature: float = 0.7, chat: bool = False) -> str:
+        if chat and hasattr(self.tokenizer, "apply_chat_template") and not prompt.startswith("<|"):
             try:
                 messages = [{"role": "user", "content": prompt}]
                 formatted = self.tokenizer.apply_chat_template(
@@ -81,8 +81,9 @@ class Generator:
         else:
             pad_len = self.seq_len - true_len
             padded = np.full((1, self.seq_len), pad_id, dtype=np.int32)
-            padded[0, pad_len:] = raw["input_ids"][0, :true_len]
+            padded[0, :true_len] = raw["input_ids"][0, :true_len]
             input_ids = padded.astype(np.int32)
+        last_pos = min(true_len, self.seq_len) - 1
 
         if max_tokens is None:
             max_tokens = self.seq_len
@@ -97,8 +98,11 @@ class Generator:
                                            input_ids=input_ids)
         else:
             hidden_states = self.root.run(x, kv_cache=kv_cache, prefill=True)
+        kv_cache["_pos"] = true_len
+        kv_cache["_prefill_len"] = true_len
+        kv_cache["_prefill_max_seq"] = self.seq_len
         logits = self._compute_logits(hidden_states)
-        next_token = self._sample(logits[:, -1, :], temperature)
+        next_token = self._sample(logits[:, last_pos, :], temperature)
 
         piece = self.tokenizer.decode([int(next_token[0, 0])])
         output_pieces.append(piece)
@@ -158,7 +162,6 @@ def _build_gen(
     num_layers: int = 0,
     real_weights: bool = False,
     reload: bool = False,
-    local_worker: Optional["WorkerNode"] = None,
 ) -> Generator:
     from transformers import AutoTokenizer
 
@@ -185,7 +188,7 @@ def _build_gen(
             "seq_end": seq_end,
         }
 
-    wp = WeightProvider(model, partitions, num_layers=num_layers, use_cache=not reload)
+    wp = WeightProvider(model, partitions, num_layers=config.num_layers, use_cache=not reload)
 
     print(f"[_build_gen] WeightProvider ready, creating RootNode with {len(worker_addrs)} workers...", flush=True)
     t0 = time.time()
@@ -193,11 +196,12 @@ def _build_gen(
     has_ple = wp.ple_dim > 0
     root = RootNode(
         worker_addrs, config,
+        num_layers=num_layers,
+        model_id=model,
         weight_provider=wp,
         ple_embedding=wp.get_ple_embedding() if has_ple else None,
         ple_projection=wp.get_ple_projection() if has_ple else None,
         ple_projection_norm=wp.get_ple_projection_norm() if has_ple else None,
-        local_worker=local_worker,
     )
 
     print(f"[_build_gen] RootNode ready in {time.time()-t0:.1f}s, loading tokenizer...", flush=True)
@@ -267,7 +271,7 @@ if __name__ == "__main__":
         ready.wait()
         worker_addrs.insert(0, ("localhost", local_worker.port))
 
-    gen = _build_gen(worker_addrs, model=args.model, num_layers=args.layers, local_worker=local_worker)
+    gen = _build_gen(worker_addrs, model=args.model, num_layers=args.layers)
 
     try:
         gen.generate(args.prompt, max_tokens=args.max_tokens, stream=True)

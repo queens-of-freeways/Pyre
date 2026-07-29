@@ -23,6 +23,7 @@ def run_generation(
     expect_workers=None,
     local_worker=True,
     no_local=False,
+    no_mdns=False,
 ):
     _ensure_imports()
     import threading
@@ -34,10 +35,10 @@ def run_generation(
 
     worker_addrs: List[Tuple[str, int]] = []
 
-    if workers:
+    if workers is not None and workers != "":
         worker_addrs = _parse_workers(workers)
 
-    if not workers:
+    if not no_mdns:
         from src.orchestrator.mdns import discover_workers
         discovered = discover_workers(
             timeout=discover_timeout,
@@ -47,7 +48,6 @@ def run_generation(
             print(f"Discovered {len(discovered)} worker(s) via mDNS")
             worker_addrs.extend(discovered)
 
-    local_worker_obj = None
     if local_worker and not no_local:
         lw = WorkerNode(host="localhost", port=0, use_mdns=False)
         ready = threading.Event()
@@ -55,17 +55,16 @@ def run_generation(
         t.start()
         ready.wait()
         worker_addrs.insert(0, ("localhost", lw.port))
-        local_worker_obj = lw
         print(f"Local worker started on port {lw.port}")
 
     if not worker_addrs:
         print("ERROR: No workers available. Start workers or use --workers.")
         return 1
 
-    gen = _build_gen(worker_addrs, model=model, num_layers=layers, reload=reload, local_worker=local_worker_obj)
+    gen = _build_gen(worker_addrs, model=model, num_layers=layers, reload=reload)
 
     try:
-        gen.generate(prompt, max_tokens=(None if chat else max_tokens), stream=True, temperature=temperature)
+        gen.generate(prompt, max_tokens=(None if chat else max_tokens), stream=True, temperature=temperature, chat=chat)
         return 0
     finally:
         gen.root.shutdown()

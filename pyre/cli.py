@@ -48,8 +48,10 @@ def main():
               help="Chat mode — generate until EOS, no need for --max-tokens")
 @click.option("--reload", is_flag=True, default=False,
               help="Force re-download model from HuggingFace, bypassing cache")
+@click.option("--no-mdns", is_flag=True, default=False,
+              help="Skip mDNS worker discovery")
 def run(model, workers, prompt, max_tokens, layers,
-        discover_timeout, expect_workers, no_local, temperature, chat, reload):
+        discover_timeout, expect_workers, no_local, temperature, chat, reload, no_mdns):
     """Run distributed generation (auto-starts a local worker)."""
     exit(run_generation(
         model=model,
@@ -63,6 +65,7 @@ def run(model, workers, prompt, max_tokens, layers,
         discover_timeout=discover_timeout,
         expect_workers=expect_workers,
         no_local=no_local,
+        no_mdns=no_mdns,
     ))
 
 

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import gc
 import socket
-import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,12 +14,11 @@ from src.attention.builder import build_ulysses_attention_graph, ShardSpec as At
 from src.ffn.builder import build_ffn_graph, ShardSpec as FFNShardSpec
 from src.orchestrator.cluster import ModelConfig, AdaptivePartitioner
 from src.orchestrator.net import send_msg, recv_msg, recv_exact
+from src.orchestrator.quantizer import quantize_weights_dict, dequantize_weights_dict
 from src.orchestrator.protocol import (
     MSG_SHARD_SPEC, MSG_READY, MSG_FORWARD_DATA, MSG_FORWARD_RESULT,
-    MSG_SHUTDOWN, MSG_ATTN_OUTPUT, MSG_FFN_RESULT, MSG_INIT_WEIGHTS,
-    MSG_DECODE_STEP, MSG_LAYER_WEIGHTS,
+    MSG_SHUTDOWN, MSG_ATTN_OUTPUT, MSG_FFN_RESULT, MSG_DECODE_STEP,
 )
-from src.orchestrator.quantizer import quantize_weights_dict
 
 
 _PYRE_KERNELS = None
@@ -89,15 +86,15 @@ class RootNode:
         self,
         worker_addrs: List[Tuple[str, int]],
         config: ModelConfig,
-        all_layer_weights: Dict[int, Dict[int, dict]] = None,
+        model_id: str = "",
         weight_provider: Optional["WeightProvider"] = None,
         ple_embedding: Optional[np.ndarray] = None,
         ple_projection: Optional[np.ndarray] = None,
         ple_projection_norm: Optional[np.ndarray] = None,
-        local_worker: Optional["WorkerNode"] = None,
+        num_layers: int = 0,
     ):
         self.config = config
-        self.all_layer_weights = all_layer_weights or {}
+        self.num_layers = num_layers if num_layers > 0 else config.num_layers
         self.device = DeviceRef.CPU()
         self.session = InferenceSession(devices=[CPU()])
         self.ple_embedding = ple_embedding
@@ -105,6 +102,7 @@ class RootNode:
         self.ple_projection_norm = ple_projection_norm
         self.ple_dim = config.ple_dim if hasattr(config, 'ple_dim') else 0
         self._wp = weight_provider
+        self._weight_cache: Dict[int, dict] = {}
 
         total_nodes = 1 + len(worker_addrs)
         self.partitions = self._solve_partitions(total_nodes)
@@ -114,13 +112,8 @@ class RootNode:
         seq_len = p0["seq_end"] - p0["seq_start"]
 
         needed_hds = {config.head_dim}
-        if all_layer_weights and 0 in all_layer_weights:
-            for lw in all_layer_weights[0].values():
-                hd = lw.get("_props", {}).get("head_dim")
-                if hd is not None:
-                    needed_hds.add(hd)
-        elif weight_provider is not None:
-            for lidx in range(config.num_layers):
+        if weight_provider is not None:
+            for lidx in range(self.num_layers):
                 lp = weight_provider.get_layer_props(lidx)
                 if lp is not None:
                     needed_hds.add(lp.head_dim)
@@ -160,69 +153,19 @@ class RootNode:
         # ── Phase 1: Connect to all workers and send shard specs ───────
         for i, (host, port) in enumerate(worker_addrs):
             worker_id = i + 1
-            is_local = (local_worker is not None
-                        and host == "localhost"
-                        and port == local_worker.port)
-
-            if is_local:
-                local_worker._local_injection_event = threading.Event()
-
             conn = self._connect_worker(host, port)
             p = self.partitions[worker_id]
             shard_spec = AttentionShardSpec(
                 ffn_dim_start=p["ffn_start"], ffn_dim_end=p["ffn_end"],
                 seq_start=p["seq_start"], seq_end=p["seq_end"],
             )
-            send_msg(conn, MSG_SHARD_SPEC, (shard_spec, config))
+            send_msg(conn, MSG_SHARD_SPEC, (shard_spec, config, model_id))
             msg_type, _ = recv_msg(conn)
             if msg_type != MSG_READY:
                 raise RuntimeError(f"Expected READY from worker {worker_id}, got {msg_type}")
 
             self.worker_conns.append(conn)
             self.worker_ids.append(worker_id)
-            self.worker_info.append((conn, worker_id, p, is_local))
-
-        # ── Phase 2: Stream weights in parallel ────────────────────────
-        if weight_provider is not None:
-            self._stream_all_weights_parallel(
-                weight_provider, config.num_layers, local_worker,
-            )
-        elif all_layer_weights:
-            # Fallback: batch send (pre-computed weights)
-            for conn, worker_id, p, is_local in self.worker_info:
-                wl = all_layer_weights.get(worker_id, {})
-                worker_data = {"weights": {k: v for k, v in wl.items()}}
-                for lidx, lw in wl.items():
-                    lp = lw.get("_props", {})
-                    worker_data.setdefault("props", {})[lidx] = lp
-                worker_data_q = quantize_weights_dict(worker_data)
-                send_msg(conn, MSG_INIT_WEIGHTS, worker_data_q)
-        else:
-            # No weights provided — send fallback random weights so workers can proceed
-            for conn, worker_id, p, is_local in self.worker_info:
-                width = p["ffn_end"] - p["ffn_start"]
-                fallback = {"weights": {}, "props": {}}
-                for lidx in range(config.num_layers):
-                    hd = config.head_dim
-                    n_q = config.n_heads
-                    n_kv = config.n_kv_heads
-                    fallback["weights"][lidx] = {
-                        "attn": {
-                            "q": np.random.randn(config.hidden_dim, n_q * hd).astype(np.float32),
-                            "k": np.random.randn(config.hidden_dim, n_kv * hd).astype(np.float32),
-                            "v": np.random.randn(config.hidden_dim, n_kv * hd).astype(np.float32),
-                            "o": np.random.randn(n_q * hd, config.hidden_dim).astype(np.float32),
-                        },
-                        "ffn": {
-                            "gate": np.random.randn(config.hidden_dim, width).astype(np.float32),
-                            "up": np.random.randn(config.hidden_dim, width).astype(np.float32),
-                            "down": np.random.randn(width, config.hidden_dim).astype(np.float32),
-                        },
-                        "_props": {"head_dim": hd},
-                    }
-                    fallback["props"][lidx] = {"head_dim": hd}
-                fallback_q = quantize_weights_dict(fallback)
-                send_msg(conn, MSG_INIT_WEIGHTS, fallback_q)
 
     def _solve_partitions(self, n):
         ffn_dim = self.config.ffn_dim
@@ -255,46 +198,6 @@ class RootNode:
                 else:
                     raise
 
-    def _stream_all_weights_parallel(self, weight_provider, num_layers, local_worker):
-        """Stream quantized weights to all workers in parallel threads.
-
-        Each thread independently loads, quantizes, and sends its worker's
-        weights.  No pre-cache phase so there is no idle gap between the
-        shard-spec handshake and the first weight send.
-        """
-        def stream_worker(conn, worker_id, p, is_local):
-            t_start = time.time()
-            print(f"  [worker {worker_id}] streaming {num_layers} layers...", flush=True)
-            for layer_idx in range(num_layers):
-                lw = weight_provider._layer_weights_for_node(
-                    layer_idx, p, full_q=True, copy_weights=True,
-                )
-                lw_q = quantize_weights_dict(lw)
-                if is_local:
-                    local_worker._compressed[layer_idx] = lw_q
-                else:
-                    send_msg(conn, MSG_LAYER_WEIGHTS, (layer_idx, lw_q))
-                del lw, lw_q
-                if layer_idx % 8 == 0:
-                    gc.collect()
-                elapsed = time.time() - t_start
-                print(f"  [worker {worker_id}] layer {layer_idx}: {elapsed:.0f}s", flush=True)
-            if is_local:
-                local_worker._local_injection_event.set()
-            print(f"  [worker {worker_id}] weight stream done in {time.time()-t_start:.1f}s", flush=True)
-
-        threads = []
-        for conn, worker_id, p, is_local in self.worker_info:
-            t = threading.Thread(
-                target=stream_worker,
-                args=(conn, worker_id, p, is_local),
-                daemon=True,
-            )
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join()
-
     @staticmethod
     def _softmax(x, axis=-1):
         out = np.empty_like(x)
@@ -309,12 +212,14 @@ class RootNode:
 
     @staticmethod
     def _apply_rope(x, rope_fraction=1.0, theta=10000.0, start_pos=0):
+        x = np.ascontiguousarray(x)
         out = np.empty_like(x)
         _get_pyre_kernels().apply_rope(x, out, np.float32(theta), np.int32(start_pos), np.float32(rope_fraction))
         return out
 
     @staticmethod
     def _apply_v_norm(v):
+        v = np.ascontiguousarray(v)
         out = np.empty_like(v)
         _get_pyre_kernels().apply_v_norm(v, out)
         return out
@@ -342,9 +247,9 @@ class RootNode:
 
         full_seq = q_full.shape[1]
         head_dim = q_full.shape[3]
-        q = q_full.transpose(0, 2, 1, 3)
-        k = k_full.transpose(0, 2, 1, 3)
-        v = v_full.transpose(0, 2, 1, 3)
+        q = np.ascontiguousarray(q_full.transpose(0, 2, 1, 3))
+        k = np.ascontiguousarray(k_full.transpose(0, 2, 1, 3))
+        v = np.ascontiguousarray(v_full.transpose(0, 2, 1, 3))
 
         rope_frac = props.get("rope_fraction", 1.0)
         use_vn = props.get("use_v_norm", False)
@@ -371,7 +276,6 @@ class RootNode:
         mask = np.triu(np.full((full_seq, full_seq), -np.inf, dtype=np.float32), k=1)
         scores = scores + mask
 
-        scores = np.clip(scores, -500, 500)
         probs = self._softmax(scores, axis=-1)
         attn = probs @ v_exp
         attn = attn.transpose(0, 2, 1, 3).reshape(1, full_seq, n_heads * head_dim)
@@ -416,7 +320,7 @@ class RootNode:
         batch, seq_len, hidden_dim = x.shape
         assert hidden_dim == self.config.hidden_dim
 
-        num_layers = self.config.num_layers
+        num_layers = self.num_layers
 
         self.adaptive_partitioner.reset_pass()
 
@@ -578,7 +482,7 @@ class RootNode:
 
         # Broadcast FFN input to all workers (true parallelism), then collect
         for idx, worker_id in enumerate(self.worker_ids):
-            send_msg(self.worker_conns[idx], MSG_ATTN_OUTPUT, (h_norm,))
+            send_msg(self.worker_conns[idx], MSG_ATTN_OUTPUT, (h_norm, layer_idx))
 
         worker_timings = {}
         for idx, worker_id in enumerate(self.worker_ids):
@@ -626,87 +530,105 @@ class RootNode:
         batch, seq, d_model = x.shape
         d_state = w["A_log"].shape[0]
         d_conv = w["conv1d"].shape[-1]
+        d_inner = w["in_proj_z"].shape[-1]  # internal SSM dim from weight shape
 
-        # 1. Linear projections
-        qkv = x @ w["in_proj_qkv"].T  # [b, s, 2*d_model]
+        # 1. Linear projections via Mojo matmul_f32
+        x_2d = x.reshape(-1, d_model)
+        qkv = np.empty((batch * seq, 2 * d_inner), dtype=np.float32)
+        _get_pyre_kernels().matmul_f32(x_2d, w["in_proj_qkv"], qkv)
+        qkv = qkv.reshape(batch, seq, 2 * d_inner)
 
-        # z gate (no conv)
-        z_gate = x @ w["in_proj_z"].T  # [b, s, d_model]
+        z_gate = np.empty((batch * seq, d_inner), dtype=np.float32)
+        _get_pyre_kernels().matmul_f32(x_2d, w["in_proj_z"], z_gate)
+        z_gate = z_gate.reshape(batch, seq, d_inner)
         z_gate = z_gate / (1.0 + np.exp(-z_gate))  # SiLU
 
-        a_proj = x @ w["in_proj_a"].T  # [b, s, d_state]  → C
-        b_proj = x @ w["in_proj_b"].T  # [b, s, d_state]  → B
+        a_proj = np.empty((batch * seq, d_state), dtype=np.float32)
+        _get_pyre_kernels().matmul_f32(x_2d, w["in_proj_a"], a_proj)
+        a_proj = a_proj.reshape(batch, seq, d_state)
 
-        # 2. Conv1d along sequence dimension (depthwise)
-        d_conv_inner = 2 * d_model
-        pad = np.repeat(qkv[:, :1, :], d_conv - 1, axis=1)  # [b, d_conv-1, 2*d_model]
-        qkv_pad = np.concatenate([pad, qkv], axis=1)  # [b, s+d_conv-1, 2*d_model]
+        b_proj = np.empty((batch * seq, d_state), dtype=np.float32)
+        _get_pyre_kernels().matmul_f32(x_2d, w["in_proj_b"], b_proj)
+        b_proj = b_proj.reshape(batch, seq, d_state)
 
-        conv_w = w["conv1d"]  # [2*d_model, 1, d_conv]
-        qkv_conv = np.zeros_like(qkv)
-        for i in range(d_conv_inner):
-            qkv_conv[:, :, i] = np.convolve(
-                qkv_pad[:, :, i].ravel(),
-                conv_w[i, 0, ::-1],
-                mode="valid",
-            ).reshape(batch, seq)
-        qkv_conv = qkv_conv / (1.0 + np.exp(-qkv_conv))  # SiLU
+        # 2. Conv1d along sequence dimension (depthwise) — Mojo kernel
+        d_conv_inner = 2 * d_inner
+        pad = np.repeat(qkv[:, :1, :], d_conv - 1, axis=1)
+        qkv_pad = np.concatenate([pad, qkv], axis=1)
+        conv_w = w["conv1d"]
+        qkv_conv = np.empty_like(qkv)
+        _get_pyre_kernels().linear_attn_conv1d(qkv_pad, conv_w, qkv_conv)
 
-        # Split → x_ssm (first d_model) and gate_conv (second d_model)
-        x_ssm = qkv_conv[..., :d_model]   # [b, s, d_model]
-        gate_conv = qkv_conv[..., d_model:]  # [b, s, d_model]
+        # Split → x_ssm (first d_inner) and gate_conv (second d_inner)
+        x_ssm = qkv_conv[..., :d_inner]
+        gate_conv = qkv_conv[..., d_inner:]
 
         # 3. SSM parameters
-        dt = np.log(1.0 + np.exp(w["dt_bias"]))  # softplus [d_state]
-        A = -np.exp(w["A_log"])  # [d_state]
-        A_bar = np.exp(A * dt)  # [d_state]
+        dt = np.log(1.0 + np.exp(w["dt_bias"]))
+        A = -np.exp(w["A_log"])
+        A_bar = np.exp(A * dt)
 
-        # 4. SSM scan (sequential)
+        # 4. SSM scan — Mojo kernel, h updated in-place
         if prev_state is not None:
             h = prev_state.copy()
         else:
-            h = np.zeros((batch, d_model, d_state), dtype=np.float32)
-
-        outputs = []
-        for t in range(seq):
-            B_t = b_proj[:, t, :]              # [b, d_state]
-            C_t = a_proj[:, t, :]              # [b, d_state]
-            x_t = x_ssm[:, t, :]               # [b, d_model]
-
-            h = h * A_bar.reshape(1, 1, d_state) + \
-                B_t[:, np.newaxis, :] * x_t[:, :, np.newaxis]
-
-            y_t = np.sum(h * C_t[:, np.newaxis, :], axis=-1)
-            outputs.append(y_t)
-
-        y = np.stack(outputs, axis=1)  # [b, seq, d_model]
+            h = np.zeros((batch, d_inner, d_state), dtype=np.float32)
+        y = np.empty((batch, seq, d_inner), dtype=np.float32)
+        _get_pyre_kernels().linear_attn_ssm_scan(x_ssm, b_proj, a_proj, A_bar, h, y)
 
         # 5. Gate: conv_gate * z_gate (both SiLU)
         y = y * gate_conv * z_gate
 
-        # 6. RMS norm
+        # 6. RMS norm (per-head, weight shape = head_dim)
         if w.get("norm") is not None:
+            head_dim_v = w["norm"].shape[0]  # e.g. 128 for Qwen3.5 (linear_value_head_dim)
+            n_vheads = d_inner // head_dim_v
+            y_r = y.reshape(batch, seq, n_vheads, head_dim_v)
             eps = 1e-6
-            variance = np.mean(y.astype(np.float64) ** 2, axis=-1, keepdims=True)
-            y = (y / np.sqrt(variance + eps)).astype(np.float32) * w["norm"]
+            variance = np.mean(y_r.astype(np.float64) ** 2, axis=-1, keepdims=True)
+            y_r = (y_r / np.sqrt(variance + eps)).astype(np.float32) * w["norm"].reshape(1, 1, 1, head_dim_v)
+            y = y_r.reshape(batch, seq, d_inner)
 
-        # 7. Output projection
-        y = y @ w["out_proj"].T
+        # 7. Output projection via Mojo matmul_f32
+        y_2d = y.reshape(-1, d_inner)
+        out = np.empty((batch * seq, d_model), dtype=np.float32)
+        _get_pyre_kernels().matmul_f32(y_2d, w["out_proj"], out)
+        y = out.reshape(batch, seq, d_model)
 
         return y, h
 
     def _decode_step(self, x: np.ndarray, decode_cache: dict,
                       input_ids: Optional[np.ndarray] = None) -> np.ndarray:
-        num_layers = self.config.num_layers
+        num_layers = self.num_layers
 
         ple_all = None
         if self.ple_embedding is not None and input_ids is not None:
             ple_all = self._compute_ple_signal(input_ids, x)
             ple_all = ple_all[:, -1:, :, :]
 
+        if "_pos" not in decode_cache:
+            if decode_cache:
+                entry = next(v for k, v in decode_cache.items() if not k.startswith("_"))
+                if isinstance(entry, tuple) and len(entry) >= 2:
+                    decode_cache["_pos"] = entry[0].shape[2]
+                else:
+                    decode_cache["_pos"] = 1
+            else:
+                decode_cache["_pos"] = 1
+
+        if "_prefill_len" not in decode_cache:
+            decode_cache["_prefill_len"] = decode_cache.get("_pos", 0)
+        if "_prefill_max_seq" not in decode_cache:
+            for k, v in decode_cache.items():
+                if not k.startswith("_"):
+                    decode_cache["_prefill_max_seq"] = v[0].shape[2]
+                    break
+
         for layer_idx in range(num_layers):
             ple_slice = ple_all[:, :, layer_idx, :] if ple_all is not None else None
             x = self._decode_single_layer(x, layer_idx, decode_cache, ple_slice)
+
+        decode_cache["_pos"] = decode_cache.get("_pos", 0) + 1
 
         if self.adaptive_partitioner.drift_detected():
             new_parts = self.adaptive_partitioner.get_partitions()
@@ -754,7 +676,7 @@ class RootNode:
                 wv_r = np.random.randn(hidden_dim, n_kv * layer_hd).astype(np.float32)
                 rw_attn["v"] = wv_r
 
-            xn_2d = x_norm[0:1]
+            xn_2d = x_norm.reshape(1, -1)
             q = np.empty((1, n_heads * layer_hd), dtype=np.float32)
             k = np.empty((1, n_kv * layer_hd), dtype=np.float32)
             _get_pyre_kernels().matmul_f32(xn_2d, wq_r, q)
@@ -779,20 +701,18 @@ class RootNode:
             else:
                 v = k.copy()
 
-            q_rope = q.transpose(0, 2, 1, 3)
-            k_rope = k.transpose(0, 2, 1, 3)
-            v_out = v.transpose(0, 2, 1, 3)
+            q_rope = np.ascontiguousarray(q.transpose(0, 2, 1, 3))
+            k_rope = np.ascontiguousarray(k.transpose(0, 2, 1, 3))
+            v_out = np.ascontiguousarray(v.transpose(0, 2, 1, 3))
 
             props = root_w.get("_props", {})
             rope_frac = props.get("rope_fraction", 1.0)
             theta = getattr(self.config, 'rope_theta', 10000.0)
-            cache_len = 0
-            if layer_idx in decode_cache:
+            cache_len = decode_cache.get("_pos", 0)
+            if cache_len == 0 and layer_idx in decode_cache:
                 entry = decode_cache[layer_idx]
-                if len(entry) == 3:
-                    cache_len = entry[2]  # cur_len from pre-allocated buffer
-                else:
-                    cache_len = entry[0].shape[2]  # seq dim from legacy format
+                if isinstance(entry, tuple) and len(entry) >= 2:
+                    cache_len = entry[0].shape[2]
             if rope_frac > 0:
                 q_rope = self._apply_rope(q_rope, rope_fraction=rope_frac,
                                            theta=theta, start_pos=cache_len)
@@ -817,7 +737,11 @@ class RootNode:
             k_full = np.clip(k_full, -1000, 1000)
             v_full = np.clip(v_full, -1000, 1000)
 
-            attn_out = self._compute_attention_decode(q_rope, k_full, v_full, layer_idx)
+            prefill_real = decode_cache.get("_prefill_len", 0)
+            prefill_max_seq = decode_cache.get("_prefill_max_seq", 0)
+            attn_out = self._compute_attention_decode(q_rope, k_full, v_full, layer_idx,
+                                                        prefill_real=prefill_real,
+                                                        prefill_max_seq=prefill_max_seq)
 
             o_weight = root_w.get("attn", {}).get("o")
             if o_weight is not None:
@@ -852,8 +776,8 @@ class RootNode:
 
         gate = np.empty((1, width0), dtype=np.float32)
         up = np.empty((1, width0), dtype=np.float32)
-        _get_pyre_kernels().matmul_f32(h_norm[0:1], ffn_gate_r, gate)
-        _get_pyre_kernels().matmul_f32(h_norm[0:1], ffn_up_r, up)
+        _get_pyre_kernels().matmul_f32(h_norm.reshape(1, -1), ffn_gate_r, gate)
+        _get_pyre_kernels().matmul_f32(h_norm.reshape(1, -1), ffn_up_r, up)
         hidden = np.empty_like(gate)
         _get_pyre_kernels().silu_mul(gate, up, hidden)
         ffn_out = np.empty((1, hidden_dim), dtype=np.float32)
@@ -888,7 +812,8 @@ class RootNode:
         return final_output
 
     @staticmethod
-    def _compute_attention_decode(q, k, v, layer_idx=0):
+    def _compute_attention_decode(q, k, v, layer_idx=0,
+                                    prefill_real=0, prefill_max_seq=0):
         n_heads = q.shape[1]
         n_kv = k.shape[1]
         head_dim = q.shape[3]
@@ -901,7 +826,9 @@ class RootNode:
         scale = np.float32(np.sqrt(head_dim))
         scores = q @ k_exp.transpose(0, 1, 3, 2) / scale
 
-        scores = np.clip(scores, -500, 500)
+        if prefill_max_seq > prefill_real:
+            scores[:, :, :, prefill_real:prefill_max_seq] = -np.inf
+
         probs = RootNode._softmax(scores, axis=-1)
         attn = probs @ v_exp
         attn = attn.transpose(0, 2, 1, 3).reshape(1, 1, n_heads * head_dim)
@@ -909,15 +836,13 @@ class RootNode:
         return attn.astype(np.float32)
 
     def _get_root_layer_weights(self, layer_idx: int) -> dict:
-        """Load one layer's weights from the weight provider on demand.
-
-        Avoids holding all root layers in RAM simultaneously.
-        Falls back to ``all_layer_weights[0]`` when no weight_provider.
-        """
         if self._wp is not None:
-            return self._wp._layer_weights_for_node(
-                layer_idx, self.partitions[0], full_q=True, copy_weights=True,
-            )
+            if layer_idx not in self._weight_cache:
+                raw = self._wp._layer_weights_for_node(
+                    layer_idx, self.partitions[0], full_q=True, copy_weights=True,
+                )
+                self._weight_cache[layer_idx] = raw
+            return self._weight_cache[layer_idx]
         if self.all_layer_weights and 0 in self.all_layer_weights:
             return self.all_layer_weights[0].get(layer_idx, {})
         return {}

@@ -209,6 +209,87 @@ def broadcast_add(a: PythonObject, b: PythonObject, result: PythonObject) raises
         rp[i] = ap[i] + bp[i % last_dim]
     return result
 
+# ── Linear attention: depthwise conv1d + SiLU ─────────────────────────────
+# qkv_pad: [B, S+dc-1, C] padded input (dc = d_conv)
+# conv_w:  [C, 1, dc]     depthwise conv weights
+# out:     [B, S, C]      output (written in-place, then SiLU applied)
+
+def linear_attn_conv1d(
+    qkv_pad: PythonObject, conv_w: PythonObject, result_: PythonObject,
+) raises -> PythonObject:
+    var qp = _ptr_f32(qkv_pad)
+    var wp = _ptr_f32(conv_w)
+    var rp = _ptr_f32(result_)
+    var B = _dim(qkv_pad, 0)
+    var S_pad = _dim(qkv_pad, 1)
+    var C = _dim(qkv_pad, 2)
+    var dc = _dim(conv_w, 2)
+    var S = S_pad - dc + 1  # output seq len
+
+    for b in range(B):
+        for c in range(C):
+            for t in range(S):
+                var acc: Float32 = 0.0
+                var base_pad = b * S_pad * C + t * C + c
+                for k in range(dc):
+                    var pad_idx = base_pad + k * C
+                    var w_idx = c * dc + (dc - 1 - k)
+                    acc += qp[pad_idx] * wp[w_idx]
+                rp[b * S * C + t * C + c] = acc
+
+    # Apply SiLU: result_ /= (1 + exp(-result_))
+    var total = B * S * C
+    for i in range(total):
+        var v = rp[i]
+        rp[i] = v / (Float32(1.0) + exp(-v))
+    return result_
+
+# ── Linear attention: SSM scan (Mamba2-style recurrent step) ──────────────
+# x:  [B, S, D]    SSM input (x_ssm)
+# Bp: [B, S, N]    input projection (B_proj)
+# Cp: [B, S, N]    output projection (C_proj)
+# A:  [N]          discretized A (A_bar)
+# h:  [B, D, N]    state — read/write, modified in-place
+# y:  [B, S, D]    output (written)
+
+def linear_attn_ssm_scan(
+    x: PythonObject, Bp: PythonObject, Cp: PythonObject,
+    A: PythonObject, h: PythonObject, y: PythonObject,
+) raises -> PythonObject:
+    var xp = _ptr_f32(x)
+    var bp = _ptr_f32(Bp)
+    var cp = _ptr_f32(Cp)
+    var ap = _ptr_f32(A)
+    var hp = _ptr_f32(h)
+    var yp = _ptr_f32(y)
+    var B = _dim(x, 0)
+    var S = _dim(x, 1)
+    var D = _dim(x, 2)
+    var N = _dim(Bp, 2)
+
+    for t in range(S):
+        # h[b,i,d] = h[b,i,d] * A[d] + B[b,t,d] * x[b,t,i]
+        for b in range(B):
+            for i in range(D):
+                for d in range(N):
+                    var h_idx = b * D * N + i * N + d
+                    var a_val = ap[d]
+                    var b_val = bp[b * S * N + t * N + d]
+                    var x_val = xp[b * S * D + t * D + i]
+                    hp[h_idx] = hp[h_idx] * a_val + b_val * x_val
+
+        # y[b,t,i] = sum_d h[b,i,d] * C[b,t,d]
+        for b in range(B):
+            for i in range(D):
+                var acc: Float32 = 0.0
+                for d in range(N):
+                    var h_idx = b * D * N + i * N + d
+                    var c_val = cp[b * S * N + t * N + d]
+                    acc += hp[h_idx] * c_val
+                yp[b * S * D + t * D + i] = acc
+
+    return y
+
 # ── Module init ──────────────────────────────────────────────────────────────
 
 @export
@@ -225,6 +306,8 @@ def PyInit_pyre_kernels() abi("C") -> PythonObject:
         m.def_function[q80_dequantize]("q80_dequantize")
         m.def_function[gelu]("gelu")
         m.def_function[broadcast_add]("broadcast_add")
+        m.def_function[linear_attn_conv1d]("linear_attn_conv1d")
+        m.def_function[linear_attn_ssm_scan]("linear_attn_ssm_scan")
         return m.finalize()
     except e:
         abort(String("failed to build pyre_kernels: ", e))

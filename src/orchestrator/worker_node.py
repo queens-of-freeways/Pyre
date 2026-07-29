@@ -4,6 +4,7 @@ import argparse
 import os
 import socket
 import sys
+import time
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -17,12 +18,11 @@ from max.driver import CPU
 from src.attention.builder import build_ulysses_attention_graph, ShardSpec as AttentionShardSpec
 from src.ffn.builder import build_ffn_graph
 from src.orchestrator.net import send_msg, recv_msg, recv_exact
+from src.orchestrator.quantizer import quantize_weights_dict, dequantize_weights_dict
 from src.orchestrator.protocol import (
     MSG_SHARD_SPEC, MSG_READY, MSG_FORWARD_DATA, MSG_FORWARD_RESULT,
-    MSG_SHUTDOWN, MSG_ATTN_OUTPUT, MSG_FFN_RESULT, MSG_INIT_WEIGHTS,
-    MSG_DECODE_STEP, MSG_LAYER_WEIGHTS,
+    MSG_SHUTDOWN, MSG_ATTN_OUTPUT, MSG_FFN_RESULT, MSG_DECODE_STEP,
 )
-from src.orchestrator.quantizer import dequantize_weights_dict
 
 
 def _make_attention_graph_key(layer_props, shard, hidden_dim, n_heads, n_kv_heads, device):
@@ -42,40 +42,27 @@ class WorkerNode:
         self.session = InferenceSession(devices=[CPU()])
         self.attn_models = {}
         self.ffn_model = None
+        self.ffn_decode_model = None
         self.shard = None
         self.config = None
         self.local_seq_len = None
         self.hidden_dim = None
-        self._compressed = {}
-        self.layer_weights = {}
-        self.layer_graph_key = {}
         self.layer_props = {}
         self._current_layer_idx: int | None = None
-        self._fallback_cache = {}  # {layer_idx: weights_dict}
-        self._local_injection_event = None  # set by RootNode for in-process workers
+        self._loaded = {}  # layer_idx → weights dict (lazy loaded)
+        self._wp = None
+        self._model_id = None
+        self._partition = None
 
-    def _get_fallback_weights(self, layer_idx):
-        """Lazily generate and cache fallback weights per layer (avoids repeated random alloc)."""
-        if layer_idx in self._fallback_cache:
-            return self._fallback_cache[layer_idx]
-        width = self.shard.ffn_dim_end - self.shard.ffn_dim_start
-        hd = self.config.head_dim
-        fw = {
-            "attn": {
-                "q": np.random.randn(self.hidden_dim, self.config.n_heads * hd).astype(np.float32),
-                "k": np.random.randn(self.hidden_dim, self.config.n_kv_heads * hd).astype(np.float32),
-                "v": np.random.randn(self.hidden_dim, self.config.n_kv_heads * hd).astype(np.float32),
-                "o": np.random.randn(self.config.n_heads * hd, self.hidden_dim).astype(np.float32),
-                "has_v_proj": True,
-            },
-            "ffn": {
-                "gate": np.random.randn(self.hidden_dim, width).astype(np.float32),
-                "up": np.random.randn(self.hidden_dim, width).astype(np.float32),
-                "down": np.random.randn(width, self.hidden_dim).astype(np.float32),
-            },
-        }
-        self._fallback_cache[layer_idx] = fw
-        return fw
+    def _load_layer_weights(self, layer_idx):
+        """Load one layer's weights from HuggingFace via WeightProvider (Q8_0 cached)."""
+        if layer_idx in self._loaded:
+            return dequantize_weights_dict(self._loaded[layer_idx])
+        lw = self._wp._layer_weights_for_node(
+            layer_idx, self._partition, full_q=True, copy_weights=False,
+        )
+        self._loaded[layer_idx] = quantize_weights_dict(lw)
+        return dequantize_weights_dict(self._loaded[layer_idx])
 
     def _compile_attention(self, head_dim: int):
         if self.shard is None:
@@ -121,9 +108,10 @@ class WorkerNode:
                         conn.close()
                         continue
 
-                    shard_spec, model_config = obj
+                    shard_spec, model_config, model_id = obj
                     self.shard = shard_spec
                     self.config = model_config
+                    self._model_id = model_id
                     self.local_seq_len = shard_spec.local_seq_len()
                     self.hidden_dim = model_config.hidden_dim
 
@@ -137,42 +125,31 @@ class WorkerNode:
                         seq_len=1, gated=True,
                     ))
 
-                    send_msg(conn, MSG_READY)
-
-                    # Check if weights were pre-injected by a local in-process root.
-                    self._compressed = {}
-                    self.layer_weights = {}  # backward-compat alias — kept as live ref
-                    self.layer_props = {}
-                    if self._local_injection_event is not None:
-                        self._local_injection_event.wait()
-                        # All layers already injected into _compressed by RootNode
-                        self.layer_props = {
-                            lidx: lw.get("_props", {})
-                            for lidx, lw in self._compressed.items()
+                    # ── Load weights from HuggingFace independently ─────────
+                    from src.orchestrator.llama_loader import WeightProvider
+                    self._partition = {
+                        "ffn_start": shard_spec.ffn_dim_start,
+                        "ffn_end": shard_spec.ffn_dim_end,
+                        "seq_start": shard_spec.seq_start,
+                        "seq_end": shard_spec.seq_end,
+                    }
+                    partitions = {0: self._partition}
+                    t0 = time.time()
+                    self._wp = WeightProvider(
+                        model_id, partitions,
+                        num_layers=model_config.num_layers, use_cache=True,
+                    )
+                    self.layer_props = {
+                        lidx: {
+                            "head_dim": p.head_dim,
+                            "has_v_proj": p.has_v_proj,
+                            "rope_fraction": p.rope_fraction,
+                            "use_v_norm": p.use_v_norm,
+                            "attention_type": p.attention_type,
+                            "kv_source_layer": p.kv_source_layer,
                         }
-                    else:
-                        # Normal TCP streaming from remote root
-                        num_layers = self.config.num_layers
-                        for layer_idx in range(num_layers):
-                            msg_type, payload = recv_msg(conn)
-                            if msg_type == MSG_LAYER_WEIGHTS:
-                                lidx, layer_payload = payload
-                            elif msg_type == MSG_INIT_WEIGHTS:
-                                # Fallback: batch receive all layers at once
-                                layer_payload = payload
-                                if isinstance(layer_payload, dict):
-                                    layer_payload = dequantize_weights_dict(layer_payload)
-                                for w_lidx, w_payload in layer_payload.get("weights", {}).items():
-                                    self._compressed[w_lidx] = w_payload
-                                self.layer_props = layer_payload.get("props", {})
-                                break
-                            else:
-                                print(f"Unexpected msg type {msg_type} during weight stream — ignoring", flush=True)
-                                conn.close()
-                                break
-
-                            self._compressed[lidx] = layer_payload
-                            self.layer_props[lidx] = layer_payload.get("_props", {})
+                        for lidx, p in self._wp._layer_props.items()
+                    }
 
                     needed_hds = set()
                     for lp in self.layer_props.values():
@@ -183,6 +160,9 @@ class WorkerNode:
                     for hd in needed_hds:
                         self.attn_models[hd] = self._compile_attention(hd)
 
+                    print(f"  [worker] weights ready in {time.time()-t0:.1f}s", flush=True)
+                    send_msg(conn, MSG_READY)
+
                     while True:
                         msg_type, data = recv_msg(conn)
                         if msg_type == MSG_SHUTDOWN:
@@ -190,13 +170,8 @@ class WorkerNode:
                         if msg_type == MSG_FORWARD_DATA:
                             layer_idx, x_slice = data
                             self._current_layer_idx = layer_idx
-                            cw = self._compressed.get(layer_idx)
-                            if cw is None:
-                                lw = self._get_fallback_weights(layer_idx)
-                                aw = lw["attn"]
-                            else:
-                                lw = dequantize_weights_dict(cw, subset="attn")
-                                aw = lw["attn"]
+                            lw = self._load_layer_weights(layer_idx)
+                            aw = lw["attn"]
                             lp = self.layer_props.get(layer_idx, {})
                             hd = lp.get("head_dim", self.config.head_dim)
 
@@ -219,15 +194,10 @@ class WorkerNode:
                                 (q.to_numpy(), k.to_numpy(), v.to_numpy()),
                             )
                         elif msg_type == MSG_ATTN_OUTPUT:
-                            (h_norm_full,) = data
-                            lidx = self._current_layer_idx
+                            (h_norm_full, lidx) = data
                             if lidx is not None:
-                                cw = self._compressed.get(lidx)
-                                if cw is None:
-                                    fw = self._get_fallback_weights(lidx)["ffn"]
-                                else:
-                                    lw = dequantize_weights_dict(cw, subset="ffn")
-                                    fw = lw["ffn"]
+                                lw = self._load_layer_weights(lidx)
+                                fw = lw["ffn"]
                                 (partial,) = self.ffn_model.execute(
                                     np.ascontiguousarray(h_norm_full),
                                     np.ascontiguousarray(fw["gate"]),
@@ -237,18 +207,8 @@ class WorkerNode:
                                 send_msg(conn, MSG_FFN_RESULT, partial.to_numpy())
                         elif msg_type == MSG_DECODE_STEP:
                             layer_idx, h_norm = data
-                            cw = self._compressed.get(layer_idx)
-                            if cw is None:
-                                fw = self._get_fallback_weights(layer_idx)["ffn"]
-                            else:
-                                ffn_q = cw.get("ffn", {})
-                                if isinstance(ffn_q, dict) and any(
-                                    isinstance(v, tuple) and v[0] == "q8"
-                                    for v in ffn_q.values() if isinstance(v, tuple)
-                                ):
-                                    fw = dequantize_weights_dict(ffn_q)
-                                else:
-                                    fw = ffn_q
+                            lw = self._load_layer_weights(layer_idx)
+                            fw = lw["ffn"]
                             (partial,) = self.ffn_decode_model.execute(
                                 np.ascontiguousarray(h_norm),
                                 np.ascontiguousarray(fw["gate"]),
