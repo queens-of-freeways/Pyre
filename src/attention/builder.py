@@ -12,6 +12,10 @@ class ShardSpec:
     ffn_dim_end: int
     seq_start: int
     seq_end: int
+    n_q_heads: int = 0
+    n_kv_heads: int = 0
+    q_head_start: int = 0
+    kv_head_start: int = 0
 
     def ffn_width(self) -> int:
         return self.ffn_dim_end - self.ffn_dim_start
@@ -31,14 +35,16 @@ def build_ulysses_attention_graph(
 ) -> Graph:
     local_seq_len = shard.local_seq_len()
     if full_q_weights:
-        n_q_local = n_heads
+        n_q_local = shard.n_q_heads if shard.n_q_heads > 0 else n_heads
+        n_kv_local = shard.n_kv_heads if shard.n_kv_heads > 0 else n_kv_heads
     else:
         n_q_local = shard.ffn_width() // head_dim
+        n_kv_local = n_kv_heads
 
     x_type = TensorType(DType.float32, [1, local_seq_len, hidden_dim], device=device)
     wq_slice_type = TensorType(DType.float32, [hidden_dim, n_q_local * head_dim], device=device)
-    wk_full_type = TensorType(DType.float32, [hidden_dim, n_kv_heads * head_dim], device=device)
-    wv_full_type = TensorType(DType.float32, [hidden_dim, n_kv_heads * head_dim], device=device)
+    wk_full_type = TensorType(DType.float32, [hidden_dim, n_kv_local * head_dim], device=device)
+    wv_full_type = TensorType(DType.float32, [hidden_dim, n_kv_local * head_dim], device=device)
 
     with Graph(
         "ulysses_attention_shard",
@@ -51,8 +57,8 @@ def build_ulysses_attention_graph(
         v = ops.matmul(x, wv_full)
         
         q = ops.reshape(q, [1, local_seq_len, n_q_local, head_dim])
-        k = ops.reshape(k, [1, local_seq_len, n_kv_heads, head_dim])
-        v = ops.reshape(v, [1, local_seq_len, n_kv_heads, head_dim])
+        k = ops.reshape(k, [1, local_seq_len, n_kv_local, head_dim])
+        v = ops.reshape(v, [1, local_seq_len, n_kv_local, head_dim])
         
         g.output(q, k, v)
 

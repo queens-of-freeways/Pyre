@@ -17,7 +17,7 @@ from src.orchestrator.net import send_msg, recv_msg, recv_exact
 from src.orchestrator.quantizer import quantize_weights_dict, dequantize_weights_dict
 from src.orchestrator.protocol import (
     MSG_SHARD_SPEC, MSG_READY, MSG_FORWARD_DATA, MSG_FORWARD_RESULT,
-    MSG_SHUTDOWN, MSG_ATTN_OUTPUT, MSG_FFN_RESULT, MSG_DECODE_STEP,
+    MSG_SHUTDOWN, MSG_ATTN_OUTPUT, MSG_FFN_RESULT, MSG_DECODE_STEP, MSG_DECODE_QKV,
 )
 
 
@@ -107,28 +107,38 @@ class RootNode:
         total_nodes = 1 + len(worker_addrs)
         self.partitions = self._solve_partitions(total_nodes)
         self.worker_addrs = worker_addrs
+        self._use_head_partitioning = total_nodes <= config.n_kv_heads
+        # Disable head partitioning if any layer has kv_source (cross-attention)
+        if self._use_head_partitioning and weight_provider is not None:
+            for lidx in range(self.num_layers):
+                lp = weight_provider.get_layer_props(lidx)
+                if lp is not None and lp.kv_source_layer is not None:
+                    self._use_head_partitioning = False
+                    break
+        self.attn_models = {}
+        self.ffn_model = None
 
         p0 = self.partitions[0]
         seq_len = p0["seq_end"] - p0["seq_start"]
 
-        needed_hds = {config.head_dim}
-        if weight_provider is not None:
-            for lidx in range(self.num_layers):
-                lp = weight_provider.get_layer_props(lidx)
-                if lp is not None:
-                    needed_hds.add(lp.head_dim)
+        if not self._use_head_partitioning:
+            needed_hds = {config.head_dim}
+            if weight_provider is not None:
+                for lidx in range(self.num_layers):
+                    lp = weight_provider.get_layer_props(lidx)
+                    if lp is not None:
+                        needed_hds.add(lp.head_dim)
 
-        attn_shard_base = AttentionShardSpec(
-            ffn_dim_start=p0["ffn_start"], ffn_dim_end=p0["ffn_end"],
-            seq_start=p0["seq_start"], seq_end=p0["seq_end"],
-        )
-        self.attn_models = {}
-        for hd in needed_hds:
-            attn_graph = build_ulysses_attention_graph(
-                attn_shard_base, config.hidden_dim, config.n_heads, config.n_kv_heads,
-                hd, self.device, full_q_weights=True,
+            attn_shard_base = AttentionShardSpec(
+                ffn_dim_start=p0["ffn_start"], ffn_dim_end=p0["ffn_end"],
+                seq_start=p0["seq_start"], seq_end=p0["seq_end"],
             )
-            self.attn_models[hd] = self.session.load(attn_graph)
+            for hd in needed_hds:
+                attn_graph = build_ulysses_attention_graph(
+                    attn_shard_base, config.hidden_dim, config.n_heads, config.n_kv_heads,
+                    hd, self.device, full_q_weights=True,
+                )
+                self.attn_models[hd] = self.session.load(attn_graph)
 
         full_seq_len = 64
         ffn_shard = FFNShardSpec(
@@ -158,6 +168,8 @@ class RootNode:
             shard_spec = AttentionShardSpec(
                 ffn_dim_start=p["ffn_start"], ffn_dim_end=p["ffn_end"],
                 seq_start=p["seq_start"], seq_end=p["seq_end"],
+                n_q_heads=p["n_q_heads"], n_kv_heads=p["n_kv_heads"],
+                q_head_start=p["q_head_start"], kv_head_start=p["kv_head_start"],
             )
             send_msg(conn, MSG_SHARD_SPEC, (shard_spec, config, model_id))
             msg_type, _ = recv_msg(conn)
@@ -170,20 +182,31 @@ class RootNode:
     def _solve_partitions(self, n):
         ffn_dim = self.config.ffn_dim
         seq_len = 64
+        n_heads = self.config.n_heads
+        n_kv = self.config.n_kv_heads
         partitions = {}
         ffn_chunk = ffn_dim // n
         seq_chunk = seq_len // n
+        nq_per_kv = n_heads // n_kv
+        nkv_base = n_kv // n
+        nkv_rem = n_kv % n
+        kv_head_idx = 0
+        q_head_idx = 0
         for i in range(n):
             ffn_start = i * ffn_chunk
             ffn_end = (i + 1) * ffn_chunk if i < n - 1 else ffn_dim
             seq_start = i * seq_chunk
             seq_end = (i + 1) * seq_chunk if i < n - 1 else seq_len
+            nkv_local = nkv_base + (1 if i < nkv_rem else 0)
+            n_ql = nq_per_kv * nkv_local
             partitions[i] = {
-                "ffn_start": ffn_start,
-                "ffn_end": ffn_end,
-                "seq_start": seq_start,
-                "seq_end": seq_end,
+                "ffn_start": ffn_start, "ffn_end": ffn_end,
+                "seq_start": seq_start, "seq_end": seq_end,
+                "n_q_heads": n_ql, "n_kv_heads": nkv_local,
+                "q_head_start": q_head_idx, "kv_head_start": kv_head_idx,
             }
+            q_head_idx += n_ql
+            kv_head_idx += nkv_local
         return partitions
 
     def _connect_worker(self, host, port, max_retries=10, delay=0.2):
@@ -227,23 +250,26 @@ class RootNode:
     def _compute_attention(self, all_qkv, layer_idx: int = 0,
                             kv_cache: Optional[dict] = None,
                             decode_cache: Optional[dict] = None,
-                            props: Optional[dict] = None) -> np.ndarray:
+                            props: Optional[dict] = None,
+                            concat_by_head: bool = False) -> np.ndarray:
         head_dim = self.config.head_dim
         n_heads = self.config.n_heads
         n_kv = self.config.n_kv_heads
+
+        axis = 2 if concat_by_head else 1
 
         kv_source = (props or {}).get("kv_source_layer", None)
         if kv_source is not None and kv_cache is not None and kv_source in kv_cache:
             k_cached, v_cached = kv_cache[kv_source]
             ids = [0] + self.worker_ids
-            q_full = np.concatenate([all_qkv[i][0] for i in ids], axis=1)
+            q_full = np.concatenate([all_qkv[i][0] for i in ids], axis=axis)
             k_full = k_cached
             v_full = v_cached
         else:
             ids = [0] + self.worker_ids
-            q_full = np.concatenate([all_qkv[i][0] for i in ids], axis=1)
-            k_full = np.concatenate([all_qkv[i][1] for i in ids], axis=1)
-            v_full = np.concatenate([all_qkv[i][2] for i in ids], axis=1)
+            q_full = np.concatenate([all_qkv[i][0] for i in ids], axis=axis)
+            k_full = np.concatenate([all_qkv[i][1] for i in ids], axis=axis)
+            v_full = np.concatenate([all_qkv[i][2] for i in ids], axis=axis)
 
         full_seq = q_full.shape[1]
         head_dim = q_full.shape[3]
@@ -379,69 +405,142 @@ class RootNode:
             if decode_cache is not None:
                 decode_cache[f"ssm_{layer_idx}"] = new_state
         else:
-            # ── Full attention — Ulysses QKV exchange ──
-            p0 = self.partitions[0]
-            x_root = x_norm[:, p0["seq_start"]:p0["seq_end"], :]
-
             layer_hd = root_w.get("_props", {}).get("head_dim", head_dim)
-            wq_r = rw_attn.get("q")
-            if wq_r is None:
-                wq_r = np.random.randn(hidden_dim, n_heads * layer_hd).astype(np.float32)
-                rw_attn["q"] = wq_r
-            wk_r = rw_attn.get("k")
-            if wk_r is None:
-                wk_r = np.random.randn(hidden_dim, n_kv * layer_hd).astype(np.float32)
-                rw_attn["k"] = wk_r
-            wv_r = rw_attn.get("v")
-            if wv_r is None:
-                wv_r = np.random.randn(hidden_dim, n_kv * layer_hd).astype(np.float32)
-                rw_attn["v"] = wv_r
 
-            hd = root_w.get("_props", {}).get("head_dim", self.config.head_dim)
-            attn_model = self.attn_models.get(hd, list(self.attn_models.values())[0])
+            has_kv_source = (root_w.get("_props", {}) or {}).get("kv_source_layer") is not None
+            if self._use_head_partitioning and not has_kv_source:
+                # ── Head-partitioned attention — local QKV for ALL positions ──
+                p0 = self.partitions[0]
+                n_q_local = p0["n_q_heads"]
+                n_kv_local = p0["n_kv_heads"]
+                wq_r = rw_attn.get("q")
+                wk_r = rw_attn.get("k")
+                wv_r = rw_attn.get("v")
+                if wq_r is None:
+                    wq_r = np.random.randn(hidden_dim, n_q_local * layer_hd).astype(np.float32)
+                    rw_attn["q"] = wq_r
 
-            v_arr = wv_r if wv_r is not None else wk_r
-            (q_root, k_root, v_root) = attn_model.execute(
-                np.ascontiguousarray(x_root),
-                np.ascontiguousarray(wq_r),
-                np.ascontiguousarray(wk_r),
-                np.ascontiguousarray(v_arr),
-            )
-            q_vals = q_root.to_numpy()
-            k_vals = k_root.to_numpy()
-            v_vals = v_root.to_numpy()
-            q_bias = rw_attn.get("q_bias")
-            k_bias = rw_attn.get("k_bias")
-            v_bias = rw_attn.get("v_bias")
-            if q_bias is not None:
-                q_vals += q_bias.reshape(1, 1, n_heads, layer_hd)
-            if k_bias is not None:
-                k_vals += k_bias.reshape(1, 1, n_kv, layer_hd)
-            if v_bias is not None and wv_r is not None:
-                v_vals += v_bias.reshape(1, 1, n_kv, layer_hd)
-            all_qkv = {0: (q_vals, k_vals, v_vals)}
+                x_2d = x_norm.reshape(-1, hidden_dim)
+                q_vals = np.empty((batch * seq_len, n_q_local * layer_hd), dtype=np.float32)
+                _get_pyre_kernels().matmul_f32(x_2d, wq_r, q_vals)
 
-            for idx, worker_id in enumerate(self.worker_ids):
-                p = self.partitions[worker_id]
-                x_worker = x_norm[:, p["seq_start"]:p["seq_end"], :]
-                send_msg(
-                    self.worker_conns[idx], MSG_FORWARD_DATA,
-                    (layer_idx, x_worker),
-                )
+                if wk_r is None:
+                    wk_r = np.random.randn(hidden_dim, n_kv_local * layer_hd).astype(np.float32)
+                    rw_attn["k"] = wk_r
+                k_vals = np.empty((batch * seq_len, n_kv_local * layer_hd), dtype=np.float32)
+                _get_pyre_kernels().matmul_f32(x_2d, wk_r, k_vals)
 
-            for idx, worker_id in enumerate(self.worker_ids):
-                _, qkv = recv_msg(self.worker_conns[idx])
-                q_w, k_w, v_w = qkv
+                if wv_r is not None:
+                    v_vals = np.empty((batch * seq_len, n_kv_local * layer_hd), dtype=np.float32)
+                    _get_pyre_kernels().matmul_f32(x_2d, wv_r, v_vals)
+                else:
+                    v_vals = k_vals.copy()
+
+                q_vals = q_vals.reshape(batch, seq_len, n_q_local, layer_hd)
+                k_vals = k_vals.reshape(batch, seq_len, n_kv_local, layer_hd)
+                v_vals = v_vals.reshape(batch, seq_len, n_kv_local, layer_hd)
+
+                q_bias = rw_attn.get("q_bias")
+                k_bias = rw_attn.get("k_bias")
+                v_bias = rw_attn.get("v_bias")
                 if q_bias is not None:
-                    q_w = q_w + q_bias.reshape(1, 1, n_heads, layer_hd)
+                    q_vals += q_bias.reshape(1, 1, n_q_local, layer_hd)
                 if k_bias is not None:
-                    k_w = k_w + k_bias.reshape(1, 1, n_kv, layer_hd)
+                    k_vals += k_bias.reshape(1, 1, n_kv_local, layer_hd)
                 if v_bias is not None and wv_r is not None:
-                    v_w = v_w + v_bias.reshape(1, 1, n_kv, layer_hd)
-                all_qkv[worker_id] = (q_w, k_w, v_w)
+                    v_vals += v_bias.reshape(1, 1, n_kv_local, layer_hd)
 
-            attn_out = self._compute_attention(all_qkv, layer_idx, kv_cache, decode_cache,
-                                                props=root_w.get("_props", {}))
+                all_qkv = {0: (q_vals, k_vals, v_vals)}
+
+                for idx, worker_id in enumerate(self.worker_ids):
+                    send_msg(
+                        self.worker_conns[idx], MSG_FORWARD_DATA,
+                        (layer_idx, x_norm),
+                    )
+
+                for idx, worker_id in enumerate(self.worker_ids):
+                    _, qkv = recv_msg(self.worker_conns[idx])
+                    all_qkv[worker_id] = qkv
+
+                attn_out = self._compute_attention(all_qkv, layer_idx, kv_cache, decode_cache,
+                                                     props=root_w.get("_props", {}),
+                                                     concat_by_head=True)
+
+                # Split the full KV cache into per-node slices for decode
+                if decode_cache is not None and layer_idx in decode_cache:
+                    full_k, full_v = decode_cache.pop(layer_idx)
+                    for node_id in [0] + self.worker_ids:
+                        p = self.partitions[node_id]
+                        kv_start = p.get("kv_head_start", 0)
+                        n_kv = p.get("n_kv_heads", 0)
+                        if n_kv > 0:
+                            decode_cache[f"hp_{layer_idx}_{node_id}"] = (
+                                np.ascontiguousarray(full_k[:, kv_start:kv_start+n_kv, :, :]),
+                                np.ascontiguousarray(full_v[:, kv_start:kv_start+n_kv, :, :]),
+                            )
+            else:
+                # ── Seq-partitioned attention (Ulysses) ──
+                p0 = self.partitions[0]
+                x_root = x_norm[:, p0["seq_start"]:p0["seq_end"], :]
+
+                wq_r = rw_attn.get("q")
+                if wq_r is None:
+                    wq_r = np.random.randn(hidden_dim, n_heads * layer_hd).astype(np.float32)
+                    rw_attn["q"] = wq_r
+                wk_r = rw_attn.get("k")
+                if wk_r is None:
+                    wk_r = np.random.randn(hidden_dim, n_kv * layer_hd).astype(np.float32)
+                    rw_attn["k"] = wk_r
+                wv_r = rw_attn.get("v")
+                if wv_r is None:
+                    wv_r = np.random.randn(hidden_dim, n_kv * layer_hd).astype(np.float32)
+                    rw_attn["v"] = wv_r
+
+                hd = root_w.get("_props", {}).get("head_dim", self.config.head_dim)
+                attn_model = self.attn_models.get(hd, list(self.attn_models.values())[0])
+
+                v_arr = wv_r if wv_r is not None else wk_r
+                (q_root, k_root, v_root) = attn_model.execute(
+                    np.ascontiguousarray(x_root),
+                    np.ascontiguousarray(wq_r),
+                    np.ascontiguousarray(wk_r),
+                    np.ascontiguousarray(v_arr),
+                )
+                q_vals = q_root.to_numpy()
+                k_vals = k_root.to_numpy()
+                v_vals = v_root.to_numpy()
+                q_bias = rw_attn.get("q_bias")
+                k_bias = rw_attn.get("k_bias")
+                v_bias = rw_attn.get("v_bias")
+                if q_bias is not None:
+                    q_vals += q_bias.reshape(1, 1, n_heads, layer_hd)
+                if k_bias is not None:
+                    k_vals += k_bias.reshape(1, 1, n_kv, layer_hd)
+                if v_bias is not None and wv_r is not None:
+                    v_vals += v_bias.reshape(1, 1, n_kv, layer_hd)
+                all_qkv = {0: (q_vals, k_vals, v_vals)}
+
+                for idx, worker_id in enumerate(self.worker_ids):
+                    p = self.partitions[worker_id]
+                    x_worker = x_norm[:, p["seq_start"]:p["seq_end"], :]
+                    send_msg(
+                        self.worker_conns[idx], MSG_FORWARD_DATA,
+                        (layer_idx, x_worker),
+                    )
+
+                for idx, worker_id in enumerate(self.worker_ids):
+                    _, qkv = recv_msg(self.worker_conns[idx])
+                    q_w, k_w, v_w = qkv
+                    if q_bias is not None:
+                        q_w = q_w + q_bias.reshape(1, 1, n_heads, layer_hd)
+                    if k_bias is not None:
+                        k_w = k_w + k_bias.reshape(1, 1, n_kv, layer_hd)
+                    if v_bias is not None and wv_r is not None:
+                        v_w = v_w + v_bias.reshape(1, 1, n_kv, layer_hd)
+                    all_qkv[worker_id] = (q_w, k_w, v_w)
+
+                attn_out = self._compute_attention(all_qkv, layer_idx, kv_cache, decode_cache,
+                                                    props=root_w.get("_props", {}))
 
             o_weight = root_w.get("attn", {}).get("o")
             if o_weight is not None:
@@ -620,7 +719,7 @@ class RootNode:
             decode_cache["_prefill_len"] = decode_cache.get("_pos", 0)
         if "_prefill_max_seq" not in decode_cache:
             for k, v in decode_cache.items():
-                if not k.startswith("_"):
+                if isinstance(k, str) and not k.startswith("_"):
                     decode_cache["_prefill_max_seq"] = v[0].shape[2]
                     break
 
@@ -661,7 +760,104 @@ class RootNode:
             prev_state = decode_cache.get(f"ssm_{layer_idx}")
             attn_out, new_state = self._run_linear_attention(x_norm, rw_attn, prev_state)
             decode_cache[f"ssm_{layer_idx}"] = new_state
+        elif self._use_head_partitioning and not (root_w.get("_props", {}) or {}).get("kv_source_layer"):
+            # ── Head-partitioned decode — local QKV, distributed attention ──
+            p0 = self.partitions[0]
+            n_q_local = p0["n_q_heads"]
+            n_kv_local = p0["n_kv_heads"]
+            layer_hd = root_w.get("_props", {}).get("head_dim", head_dim)
+            props = root_w.get("_props", {})
+            rope_frac = props.get("rope_fraction", 1.0)
+            theta = getattr(self.config, 'rope_theta', 10000.0)
+
+            wq_r = rw_attn.get("q")
+            wk_r = rw_attn.get("k")
+            if wq_r is None:
+                wq_r = np.random.randn(hidden_dim, n_q_local * layer_hd).astype(np.float32)
+                rw_attn["q"] = wq_r
+            if wk_r is None:
+                wk_r = np.random.randn(hidden_dim, n_kv_local * layer_hd).astype(np.float32)
+                rw_attn["k"] = wk_r
+            wv_r = rw_attn.get("v")
+
+            # Root local QKV
+            xn_2d = x_norm.reshape(1, -1)
+            q = np.empty((1, n_q_local * layer_hd), dtype=np.float32)
+            k = np.empty((1, n_kv_local * layer_hd), dtype=np.float32)
+            _get_pyre_kernels().matmul_f32(xn_2d, wq_r, q)
+            _get_pyre_kernels().matmul_f32(xn_2d, wk_r, k)
+            q_bias = rw_attn.get("q_bias")
+            k_bias = rw_attn.get("k_bias")
+            if q_bias is not None: q += q_bias.reshape(1, -1)
+            if k_bias is not None: k += k_bias.reshape(1, -1)
+            q = q.reshape(1, 1, n_q_local, layer_hd)
+            k = k.reshape(1, 1, n_kv_local, layer_hd)
+
+            if wv_r is not None:
+                v = np.empty((1, n_kv_local * layer_hd), dtype=np.float32)
+                _get_pyre_kernels().matmul_f32(xn_2d, wv_r, v)
+                v_bias = rw_attn.get("v_bias")
+                if v_bias is not None: v += v_bias.reshape(1, -1)
+                v = v.reshape(1, 1, n_kv_local, layer_hd)
+            else:
+                v = k.copy()
+
+            # RoPE
+            q_rope = np.ascontiguousarray(q.transpose(0, 2, 1, 3))
+            k_rope = np.ascontiguousarray(k.transpose(0, 2, 1, 3))
+            v_out = np.ascontiguousarray(v.transpose(0, 2, 1, 3))
+            cache_len = decode_cache.get("_pos", 0)
+            if cache_len == 0 and layer_idx in decode_cache:
+                entry = decode_cache[layer_idx]
+                if isinstance(entry, tuple) and len(entry) >= 2:
+                    cache_len = entry[0].shape[2]
+            if rope_frac > 0:
+                q_rope = self._apply_rope(q_rope, rope_fraction=rope_frac, theta=theta, start_pos=cache_len)
+                k_rope = self._apply_rope(k_rope, rope_fraction=rope_frac, theta=theta, start_pos=cache_len)
+
+            # Append to root local cache (per-node KV)
+            cache_key = f"hp_{layer_idx}_0"
+            if cache_key in decode_cache:
+                cached_k, cached_v = decode_cache[cache_key]
+                k_local = np.concatenate([cached_k, k_rope], axis=2)
+                v_local = np.concatenate([cached_v, v_out], axis=2)
+            else:
+                k_local = k_rope
+                v_local = v_out
+            decode_cache[cache_key] = (k_local, v_local)
+
+            # Root local GQA attention (on root's local KV slice)
+            full_seq = k_local.shape[2]
+            n_q_per_kv = n_q_local // n_kv_local
+            k_exp = k_local[:, :, None, :, :].repeat(n_q_per_kv, axis=2).reshape(1, n_q_local, full_seq, layer_hd)
+            v_exp = v_local[:, :, None, :, :].repeat(n_q_per_kv, axis=2).reshape(1, n_q_local, full_seq, layer_hd)
+            scale = np.float32(np.sqrt(layer_hd))
+            scores = q_rope @ k_exp.transpose(0, 1, 3, 2) / scale
+            prefill_real = decode_cache.get("_prefill_len", 0)
+            prefill_max_seq = decode_cache.get("_prefill_max_seq", 0)
+            if prefill_max_seq > prefill_real:
+                scores[:, :, :, prefill_real:prefill_max_seq] = -np.inf
+            probs = self._softmax(scores, axis=-1)
+            partial_attn = probs @ v_exp  # [1, n_q_local, 1, hd]
+            all_partial = {0: partial_attn.transpose(0, 2, 1, 3).reshape(1, 1, n_q_local * layer_hd)}
+
+            # Workers compute their local attention
+            for idx, worker_id in enumerate(self.worker_ids):
+                send_msg(self.worker_conns[idx], MSG_DECODE_QKV, (layer_idx, x_norm, cache_len))
+            for idx, worker_id in enumerate(self.worker_ids):
+                _, partial_w = recv_msg(self.worker_conns[idx])
+                all_partial[worker_id] = partial_w
+
+            # Concatenate partial attention outputs by head dim
+            ids = [0] + self.worker_ids
+            attn_out = np.concatenate([all_partial[i] for i in ids], axis=-1)  # [1, 1, n_heads * hd]
+            o_weight = rw_attn.get("o")
+            if o_weight is not None:
+                ao = np.empty((1, hidden_dim), dtype=np.float32)
+                _get_pyre_kernels().matmul_f32(attn_out.reshape(1, -1), o_weight, ao)
+                attn_out = ao.reshape(1, 1, hidden_dim)
         else:
+            # ── Full-attention (Ulysses) decode — all heads at root ──
             layer_hd = root_w.get("_props", {}).get("head_dim", head_dim)
             wq_r = rw_attn.get("q")
             if wq_r is None:
@@ -722,7 +918,6 @@ class RootNode:
             # ---- Append to KV cache (concatenation) ----
             if layer_idx in decode_cache:
                 if len(decode_cache[layer_idx]) == 3:
-                    # Pre-allocated buffer format — ignore, re-init via old path
                     del decode_cache[layer_idx]
             if layer_idx in decode_cache:
                 cached_k, cached_v = decode_cache[layer_idx]
@@ -838,12 +1033,15 @@ class RootNode:
     def _get_root_layer_weights(self, layer_idx: int) -> dict:
         if self._wp is not None:
             if layer_idx not in self._weight_cache:
+                lp = self._wp.get_layer_props(layer_idx)
+                has_kv_source = lp is not None and lp.kv_source_layer is not None
+                full_q = not self._use_head_partitioning or has_kv_source
                 raw = self._wp._layer_weights_for_node(
-                    layer_idx, self.partitions[0], full_q=True, copy_weights=True,
+                    layer_idx, self.partitions[0],
+                    full_q=full_q, copy_weights=True,
                 )
-                # Quantize FFN only (~88% of weight memory), keep attention float32
-                raw["ffn"] = quantize_weights_dict(raw.get("ffn", {}), mode="f16")
-                self._weight_cache[layer_idx] = raw
+                # Store everything in f16 (2× memory savings)
+                self._weight_cache[layer_idx] = quantize_weights_dict(raw, mode="f16")
             return dequantize_weights_dict(self._weight_cache[layer_idx])
         if self.all_layer_weights and 0 in self.all_layer_weights:
             return self.all_layer_weights[0].get(layer_idx, {})

@@ -744,12 +744,16 @@ def _slice_attn_for_node(
     head_start: int,
     head_end: int,
     copy_weights: bool = True,
+    n_kv_local: int | None = None,
+    kv_head_start: int = 0,
 ) -> dict:
     lw = full.layer_weights[layer_idx]
     hd = lw.props.head_dim if lw.props else full.head_dim
     q_end = head_end * hd
-    kv_dim = full.n_kv_heads * hd
-    o_dim = full.n_heads * hd
+    kv_dim = (n_kv_local if n_kv_local is not None else full.n_kv_heads) * hd
+    kv_start = kv_head_start * hd if n_kv_local is not None else head_start * hd
+    kv_end = kv_start + kv_dim
+    o_dim = head_end * hd
 
     def _c(arr, slc):
         if arr is None:
@@ -760,18 +764,28 @@ def _slice_attn_for_node(
 
     result = {
         "q": _c(lw.q, lw.q[:, head_start * hd:q_end]),
-        "k": _c(lw.k, lw.k[:, :kv_dim]),
+        "k": _c(lw.k, lw.k[:, kv_start:kv_end]),
         "v": None,
         "o": _c(lw.o, lw.o[:, :o_dim]) if lw.o is not None else None,
         "has_v_proj": lw.has_v_proj,
     }
+    # Root (head_start==0) keeps full O for centralized projection
+    if head_start == 0 and lw.o is not None:
+        result["o"] = _c(lw.o, lw.o[:, :full.n_heads * hd])
     if lw.v is not None:
-        result["v"] = _c(lw.v, lw.v[:, :kv_dim])
+        result["v"] = _c(lw.v, lw.v[:, kv_start:kv_end])
     elif lw.has_v_proj:
         if isinstance(lw.k, torch.Tensor):
-            result["v"] = _c(lw.k, lw.k[:, :kv_dim])
+            result["v"] = _c(lw.k, lw.k[:, kv_start:kv_end])
         else:
             result["v"] = result["k"].copy() if copy_weights else result["k"]
+    # Biases
+    if lw.q_bias is not None:
+        result["q_bias"] = _c(lw.q_bias, lw.q_bias[head_start * hd:q_end])
+    if lw.k_bias is not None:
+        result["k_bias"] = _c(lw.k_bias, lw.k_bias[kv_start:kv_end])
+    if lw.v_bias is not None:
+        result["v_bias"] = _c(lw.v_bias, lw.v_bias[kv_start:kv_end])
     return result
 
 
@@ -1357,10 +1371,18 @@ class WeightProvider:
                 "v_bias": _slice(lw.v_bias, self.full.n_kv_heads * hd) if lw.v_bias is not None else None,
             }
         else:
-            ffn_width = p["ffn_end"] - p["ffn_start"]
-            n_q_local = ffn_width // hd if ffn_width > 0 else self.full.n_heads
-            attn = _slice_attn_for_node(self.full, layer_idx, 0, n_q_local,
-                                        copy_weights=copy_weights)
+            n_q_local = p.get("n_q_heads", self.full.n_heads)
+            n_kv_local = p.get("n_kv_heads", self.full.n_kv_heads)
+            q_head_start = p.get("q_head_start", 0)
+            kv_head_start = p.get("kv_head_start", 0)
+            # If n_q_heads is not set, fall back to ffn_width-based estimate
+            if "n_q_heads" not in p:
+                ffn_width = p["ffn_end"] - p["ffn_start"]
+                n_q_local = ffn_width // hd if ffn_width > 0 else self.full.n_heads
+            attn = _slice_attn_for_node(self.full, layer_idx, q_head_start, q_head_start + n_q_local,
+                                        copy_weights=copy_weights,
+                                        n_kv_local=n_kv_local,
+                                        kv_head_start=kv_head_start)
         ffn = _slice_ffn_for_node(self.full, layer_idx, p["ffn_start"], p["ffn_end"],
                                    copy_weights=copy_weights)
         props_dict = {

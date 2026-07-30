@@ -26,26 +26,27 @@ class Generator:
         has_ple: bool = False,
         final_norm: Optional[np.ndarray] = None,
     ):
-        self.root = root
-        self.tokenizer = tokenizer
-        self.lm_head = lm_head
-        self.embedding = embedding
         self.seq_len = seq_len
         self.has_ple = has_ple
-        self.final_norm = final_norm
+        # Store everything in float16 (2× memory savings)
+        self.lm_head = lm_head.astype(np.float16) if lm_head is not None else None
+        self.embedding = embedding.astype(np.float16) if embedding is not None else None
+        self.final_norm = final_norm.astype(np.float16) if final_norm is not None else None
+        self.root = root
+        self.tokenizer = tokenizer
 
     def _embed(self, input_ids: np.ndarray) -> np.ndarray:
-        return self.embedding[input_ids]
+        return self.embedding[input_ids].astype(np.float32)
 
     def _rms_norm(self, x, eps=1e-6):
         variance = np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True)
         x_norm = x / np.sqrt(variance + eps)
-        return (x_norm * self.final_norm).astype(np.float32)
+        return (x_norm * self.final_norm.astype(np.float32)).astype(np.float32)
 
     def _compute_logits(self, hidden_states: np.ndarray) -> np.ndarray:
         if self.final_norm is not None:
             hidden_states = self._rms_norm(hidden_states)
-        return hidden_states @ self.lm_head.T
+        return hidden_states @ self.lm_head.astype(np.float32).T
 
     @staticmethod
     def _sample(logits: np.ndarray, temperature: float = 0.7) -> np.ndarray:
