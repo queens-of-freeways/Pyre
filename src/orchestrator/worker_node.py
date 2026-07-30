@@ -18,7 +18,7 @@ from max.driver import CPU
 from src.attention.builder import build_ulysses_attention_graph, ShardSpec as AttentionShardSpec
 from src.ffn.builder import build_ffn_graph
 from src.orchestrator.net import send_msg, recv_msg, recv_exact
-from src.orchestrator.quantizer import quantize_weights_dict, dequantize_weights_dict
+from src.orchestrator.quantizer import quantize_weights_dict, dequantize_weights_dict, dequantize_activation
 from src.orchestrator.root_node import _get_pyre_kernels
 from src.orchestrator.protocol import (
     MSG_SHARD_SPEC, MSG_READY, MSG_FORWARD_DATA, MSG_FORWARD_RESULT,
@@ -177,6 +177,8 @@ class WorkerNode:
                             break
                         if msg_type == MSG_FORWARD_DATA:
                             layer_idx, x_data = data
+                            if isinstance(x_data, tuple):
+                                x_data = dequantize_activation(x_data)
                             self._current_layer_idx = layer_idx
                             lw = self._load_layer_weights(layer_idx)
                             aw = lw["attn"]
@@ -235,6 +237,8 @@ class WorkerNode:
                                 )
                         elif msg_type == MSG_DECODE_QKV:
                             layer_idx, x_norm, cache_len = data
+                            if isinstance(x_norm, tuple):
+                                x_norm = dequantize_activation(x_norm)
                             lw = self._load_layer_weights(layer_idx)
                             aw = lw["attn"]
                             lp = self.layer_props.get(layer_idx, {})

@@ -14,7 +14,7 @@ from src.attention.builder import build_ulysses_attention_graph, ShardSpec as At
 from src.ffn.builder import build_ffn_graph, ShardSpec as FFNShardSpec
 from src.orchestrator.cluster import ModelConfig, AdaptivePartitioner
 from src.orchestrator.net import send_msg, recv_msg, recv_exact
-from src.orchestrator.quantizer import quantize_weights_dict, dequantize_weights_dict
+from src.orchestrator.quantizer import quantize_weights_dict, dequantize_weights_dict, quantize_activation
 from src.orchestrator.protocol import (
     MSG_SHARD_SPEC, MSG_READY, MSG_FORWARD_DATA, MSG_FORWARD_RESULT,
     MSG_SHUTDOWN, MSG_ATTN_OUTPUT, MSG_FFN_RESULT, MSG_DECODE_STEP, MSG_DECODE_QKV,
@@ -455,7 +455,7 @@ class RootNode:
                 for idx, worker_id in enumerate(self.worker_ids):
                     send_msg(
                         self.worker_conns[idx], MSG_FORWARD_DATA,
-                        (layer_idx, x_norm),
+                        (layer_idx, quantize_activation(x_norm)),
                     )
 
                 for idx, worker_id in enumerate(self.worker_ids):
@@ -525,7 +525,7 @@ class RootNode:
                     x_worker = x_norm[:, p["seq_start"]:p["seq_end"], :]
                     send_msg(
                         self.worker_conns[idx], MSG_FORWARD_DATA,
-                        (layer_idx, x_worker),
+                        (layer_idx, quantize_activation(x_worker)),
                     )
 
                 for idx, worker_id in enumerate(self.worker_ids):
@@ -843,7 +843,7 @@ class RootNode:
 
             # Workers compute their local attention
             for idx, worker_id in enumerate(self.worker_ids):
-                send_msg(self.worker_conns[idx], MSG_DECODE_QKV, (layer_idx, x_norm, cache_len))
+                send_msg(self.worker_conns[idx], MSG_DECODE_QKV, (layer_idx, quantize_activation(x_norm), cache_len))
             for idx, worker_id in enumerate(self.worker_ids):
                 _, partial_w = recv_msg(self.worker_conns[idx])
                 all_partial[worker_id] = partial_w

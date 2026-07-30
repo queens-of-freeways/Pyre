@@ -51,6 +51,22 @@ def dequantize_from_f16(data: tuple) -> np.ndarray:
     return np.ascontiguousarray(arr.astype(np.float32).reshape(shape))
 
 
+def quantize_activation(arr: np.ndarray) -> tuple:
+    """Q8_0 quantization for network transfer of activations.
+    
+    Returns a pickle-friendly tuple (qdata, scales, orig_shape).
+    ~4x compression vs float32.
+    """
+    qdata, scales, orig_shape = quantize_q80(arr)
+    return (qdata, scales, orig_shape)
+
+
+def dequantize_activation(data: tuple) -> np.ndarray:
+    """Restore a Q8_0 activation tuple back to float32."""
+    qdata, scales, orig_shape = data
+    return dequantize_q80(qdata, scales, orig_shape)
+
+
 def quantize_weights_dict(weights: dict, mode: str = "q8") -> dict:
     """Recursively quantize all numpy arrays in a weight dict.
 
