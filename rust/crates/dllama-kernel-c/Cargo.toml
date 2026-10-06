@@ -1,0 +1,12 @@
+[package]
+name = "dllama-kernel-c"
+description = "Reference kernel backend cdylib: exports the dllama C-ABI v1 symbols (loads via DLLAMA_KERNEL_LIB)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dllama-kernel = { path = "../dllama-kernel" }

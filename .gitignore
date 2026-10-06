@@ -17,3 +17,9 @@ server
 /dllama-*
 *.exe
 *.spv
+
+# Pyre engine (Rust) build outputs
+/rust/target
+*.err
+*.log
+/rust/mojo/*.so

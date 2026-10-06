@@ -1,0 +1,13 @@
+[package]
+name = "dllama-gguf"
+description = "GGUF container loader: metadata -> ModelMeta rule table + tensor registry (model-agnostic loading)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dllama-ir = { path = "../dllama-ir" }
+dllama-model = { path = "../dllama-model" }
+dllama-quant = { path = "../dllama-quant" }
+dllama-tokenizer = { path = "../dllama-tokenizer" }
+memmap2 = "0.9"

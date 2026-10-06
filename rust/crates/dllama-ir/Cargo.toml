@@ -1,0 +1,6 @@
+[package]
+name = "dllama-ir"
+description = "Model-agnostic computation-graph IR and tensor-parallel sharding planner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

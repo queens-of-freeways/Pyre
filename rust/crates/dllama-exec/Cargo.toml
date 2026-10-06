@@ -1,0 +1,12 @@
+[package]
+name = "dllama-exec"
+description = "Single-node graph executor with C++-parity numerics (q80 activation casts, rope caches, GQA)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dllama-ir = { path = "../dllama-ir" }
+dllama-model = { path = "../dllama-model" }
+dllama-kernel = { path = "../dllama-kernel" }
+dllama-quant = { path = "../dllama-quant" }

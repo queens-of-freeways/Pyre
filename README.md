@@ -1,143 +1,154 @@
-![Distributed Llama](.github/cover.png)
+# Pyre
 
-# Distributed Llama
+**A model-agnostic, distributed LLM inference engine.** Run any GGUF quantization (or dllama `.m`) model, chat with it from a friendly CLI, serve it over an OpenAI-style API, and scale across multiple machines — with pluggable compute backends (CPU AVX2, OpenCL GPU, Mojo) that all produce **bit-identical** results.
 
-[![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/b4rtaz/distributed-llama/.github%2Fworkflows%2Fmain.yml?style=flat-square)](https://github.com/b4rtaz/distributed-llama/actions) [![License: MIT](https://img.shields.io/github/license/mashape/apistatus.svg?style=flat-square)](/LICENSE) [![Discord](https://discordapp.com/api/guilds/1245814812353495070/widget.png?style=shield)](https://n4no.com/projects/distributedLlama/discord.php)
+Pyre is a full Rust rewrite and extension of [distributed-llama](https://github.com/b4rtaz/distributed-llama) (the C++ reference lives on in `src/` as the parity oracle).
 
-Connect home devices into a powerful cluster to accelerate LLM inference. More devices mean faster performance, leveraging tensor parallelism and high-speed synchronization over Ethernet.
+---
 
-Supports Linux, macOS, and Windows. Optimized for ARM and x86_64 AVX2 CPUs.
+## Quick start
 
-**How to Run**
-- [💻 How to Run on Linux, MacOS or Windows](./docs/HOW_TO_RUN_LINUX_MACOS_WIN.md)
-- [🍓 How to Run on Raspberry Pi](./docs/HOW_TO_RUN_RASPBERRYPI.md)
-- [🧠 How to Run on GPU](./docs/HOW_TO_RUN_GPU.md)
+**1. Build** (needs the Rust toolchain):
+```bash
+cargo build --release          # from the repo root: cd rust && cargo build --release
+```
 
-**News**
-- 16 Sep 2025 - Qwen 3 MoE models are now supported on Vulkan.
-- 5 Sep 2025 - Qwen 3 MoE models are now supported on CPU.
-- 3 Aug 2025 - Qwen 3 0.6B, 1.7B, 8B and 14B models are now supported.
-- 23 Mar 2025 - [🌋 Experimental Vulkan support](https://github.com/b4rtaz/distributed-llama/releases/tag/v0.13.0)
-- 12 Feb 2025 - 🚧 Merged the [fundamental codebase refactor](https://github.com/b4rtaz/distributed-llama/releases/tag/v0.12.0)
-- 9 Jan 2025 - [🍎 Llama 3.3 70B on 4 x Mac Mini M4 Pro 24GB RAM](https://github.com/b4rtaz/distributed-llama/discussions/147)
+**2. Drop a model into `./models/`** — any `.gguf` file works. For example grab a Qwen3 GGUF from Hugging Face:
+```bash
+mkdir models
+# e.g. bartowski/Qwen_Qwen3-0.6B-GGUF → Qwen_Qwen3-0.6B-Q4_K_M.gguf
+```
 
-### 🔥 Setup Root Node by Single Command
+**3. Chat:**
+```bash
+rust/target/release/dllama-rs chat 0.6B        # fuzzy name match — no paths to type
+```
 
-Python 3 and C++ compiler required. The command will download the model and the tokenizer.
+That's it. Type a message, get a streamed answer, empty line to quit.
 
-| Model                             | Size     | Command                                              |
-| --------------------------------- | -------- | ---------------------------------------------------- |
-| Llama 3.1 8B Instruct Q40         | 6.32 GB  | `python launch.py llama3_1_8b_instruct_q40`          |
-| Llama 3.1 405B Instruct Q40       | 238 GB   | `python launch.py llama3_1_405b_instruct_q40`.       |
-| Llama 3.2 1B Instruct Q40         | 1.7 GB   | `python launch.py llama3_2_1b_instruct_q40`          |
-| Llama 3.2 3B Instruct Q40         | 3.4 GB   | `python launch.py llama3_2_3b_instruct_q40`          |
-| Llama 3.3 70B Instruct Q40        | 40 GB    | `python launch.py llama3_3_70b_instruct_q40`         |
-| DeepSeek R1 Distill Llama 8B Q40  | 6.32 GB  | `python launch.py deepseek_r1_distill_llama_8b_q40`  |
-| Qwen 3 0.6B Q40                   | 0.9 GB   | `python launch.py qwen3_0.6b_q40`                    |
-| Qwen 3 1.7B Q40                   | 2.2 GB   | `python launch.py qwen3_1.7b_q40`                    |
-| Qwen 3 8B Q40                     | 6.7 GB   | `python launch.py qwen3_8b_q40`                      |
-| Qwen 3 14B Q40                    | 10.9 GB  | `python launch.py qwen3_14b_q40`                     |
-| Qwen 3 30B A3B Q40                | 17.0 GB  | `python launch.py qwen3_30b_a3b_q40`                 |
+---
 
-### 🛠️ Convert Model Manually
+## The CLI
 
-* [🤗 How to Convert Hugging Face Model](./docs/HOW_TO_CONVERT_HF_MODEL.md)
+| Command | What it does |
+|---|---|
+| `dllama-rs chat [model]` | interactive chat — streams tokens, multi-turn, remembers context |
+| `dllama-rs ask [model] "question"` | one-shot answer |
+| `dllama-rs models` | list discovered models |
+| `dllama-rs ppl [model] --prompt "text"` | perplexity of a text |
+| `dllama-rs serve [model] [--port 8080]` | OpenAI-style `/v1` API server |
+| `dllama-rs nodes` | list auto-discovered cluster nodes |
+| `dllama-rs perplexity-dist --workers auto ...` | distributed perplexity |
+| `dllama-rs worker` | start a cluster worker (auto-discoverable) |
 
-### 🚧 Known Limitations
+You never type paths: models are found automatically in `./models`, `$DLLAMA_MODELS_DIR`, or next to the binary. Names match fuzzily (`chat qwen3`, `ask q40`), and with exactly one model present you can omit the name entirely: `dllama-rs chat`.
 
-* You can run Distributed Llama only on 1, 2, 4... 2^n nodes.
-* The maximum number of nodes is equal to the number of KV heads in the model [#70](https://github.com/b4rtaz/distributed-llama/issues/70).
-* Only the following quantizations are supported [#183](https://github.com/b4rtaz/distributed-llama/issues/183):
-  * `q40` model with `q80` `buffer-float-type`
-  * `f32` model with `f32` `buffer-float-type`
-
-### 👷 Architecture
-
-````
-[🔀 SWITCH OR ROUTER]
-      | | | |
-      | | | |_______ 🔸 device1 (ROOT)     10.0.0.1
-      | | |_________ 🔹 device2 (WORKER 1) 10.0.0.2:9999
-      | |___________ 🔹 device3 (WORKER 2) 10.0.0.3:9999
-      |_____________ 🔹 device4 (WORKER 3) 10.0.0.4:9999
-                        ...
-````
-
-The project is split up into two parts:
-* **🔸 Root node** - it's responsible for loading the model and weights and forward them to workers. Also, it synchronizes the state of the neural network. The root node is also a worker, it processes own slice of the neural network.
-* **🔹 Worker node** - it processes own slice of the neural network. It doesn't require any configuration related to the model.
-
-You always need the root node and you can add 2^n - 1 worker nodes to speed up the inference. The RAM usage of the neural network is split up across all nodes. The root node requires a bit more RAM than worker nodes.
-
-### 🎹 Commands
-
-* `dllama inference` - run the inference with a simple benchmark,
-* `dllama chat` - run the CLI chat,
-* `dllama worker` - run the worker node,
-* `dllama-api` - run the API server.
-
-<details>
-
-<summary>🎹 Supported Arguments</summary>
-
-<br />Inference, Chat, API
-
-| Argument                     | Description                                                      | Example                                |
-| ---------------------------- | ---------------------------------------------------------------- | -------------------------------------- |
-| `--model <path>`             | Path to model.                                                   | `dllama_model_meta-llama-3-8b_q40.m`   |
-| `--tokenizer <path>`         | Tokenizer to model.                                              | `dllama_tokenizer_llama3.t`            |
-| `--buffer-float-type <type>` | Float precision of synchronization.                              | `q80`                                  |
-| `--workers <workers>`        | Addresses of workers (ip:port), separated by space.              | `10.0.0.1:9999 10.0.0.2:9999`          |
-| `--max-seq-len <n>`          | The maximum sequence length, it helps to reduce the RAM usage.   | `4096`                                 |
-
-Inference, Chat, Worker, API
-
-| Argument                     | Description                                                           | Example                             |
-| ---------------------------- | --------------------------------------------------------------------- | ----------------------------------- |
-| `--nthreads <n>`             | Amount of threads. Don't set a higher value than number of CPU cores. | `4`                                 |
-
-Worker, API
-
-| Argument                     | Description                       | Example           |
-| ---------------------------- | --------------------------------- | ----------------- |
-| `--host <addr>`              | Binding address.                  | `127.0.0.1`       |
-| `--port <port>`              | Binding port.                     | `9999`            |
-
-Inference
-
-| Argument                     | Description                    | Example            |
-| ---------------------------- | ------------------------------ | ------------------ |
-| `--prompt <prompt>`          | Initial prompt.                | `"Hello World"`    |
-| `--steps <steps>`            | Number of tokens to generate.  | `256`              |
-
-</details>
-
-## 📊 Measurements
-
-Please check the [discussions](https://github.com/b4rtaz/distributed-llama/discussions) section, where many measurements were published on different configurations.
-
-## ✋ Contribution
-
-Feel free to contribute to this project. For small changes, simply create a new merge request. For larger changes, please create an issue to discuss your plans. Please follow these guidelines when contributing:
-
-* Make only minimal changes and avoid modifying files that are not necessary.
-* Ensure the code is compatible across all supported systems and CPUs.
-* This repository is maintained in English.
-
-## 💡 License
-
-This project is released under the MIT license.
-
-## 📖 Citation
+### Useful flags
 
 ```
-@misc{dllama,
-  author = {Bartłomiej Tadych},
-  title = {Distributed Llama},
-  year = {2024},
-  publisher = {GitHub},
-  journal = {GitHub repository},
-  howpublished = {\url{https://github.com/b4rtaz/distributed-llama}},
-  commit = {7eb77ca93ec0d502e28d36b6fb20039b449cbea4}
-}
+--threads N            CPU threads for matmuls (default: all cores)
+--temperature 0.7      sampling (0 = greedy, the deterministic default)
+--top-k 40 --top-p 0.9 sampling filters (with --temperature)
+--seed N               reproducible sampling
+--steps N              max tokens to generate
+--system "text"        custom system prompt
 ```
+
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `DLLAMA_RUST_GPU=0` | disable the OpenCL GPU accelerant |
+| `DLLAMA_KERNEL_LIB=path` | load an alternate kernel backend (`.dll`/`.so`) |
+| `DLLAMA_RS_THREADS=N` | like `--threads`, works everywhere |
+| `DLLAMA_PREFILL=0` | disable batched prompt processing |
+
+---
+
+## Models
+
+- **GGUF** (recommended): llama-3, mistral, qwen2/qwen3, qwen3-MoE, smollm, exa families — Q4_0, Q4_K, Q6_K, Q8_0, F16, F32. Tokenizer and chat template are embedded — just drop the file in.
+- **dllama `.m`**: the original format with its `.t` tokenizer (Qwen3 builds available from the upstream converter). Place the `.t` next to the `.m`.
+
+Both formats work identically through every command.
+
+## Cluster: run a model across machines
+
+Every machine runs a worker; the root discovers them automatically (UDP broadcast, port 9990 — no config files, no address lists):
+
+```bash
+# on each worker machine:
+dllama-rs worker                     # listens + answers discovery probes
+
+# on the root machine:
+dllama-rs nodes                      # see who's out there
+dllama-rs perplexity-dist --workers auto --model <name> --prompt "text"
+```
+
+Tensor-parallel sharding: each node holds 1/n of the weights and activations; nodes sync activations per layer over TCP. Requirements: node count is a power of two, and ≤ the model's KV-head count (GQA). With n nodes, a machine needs ~1/n the RAM.
+
+Notes: same-machine roots find workers on loopback (works across WSL2); remote workers answer from their LAN IP. Explicit addresses still work: `--workers 192.168.1.10:9998 192.168.1.11:9998`.
+
+## API server
+
+```bash
+dllama-rs serve qwen3 --port 8080
+```
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Say hi"}],"temperature":0.7,"max_tokens":50}'
+```
+`temperature`, `top_p`, `top_k`, `seed` and `stream` (SSE) are supported per request.
+
+## Backends (all bit-exact with each other)
+
+Pyre's kernel ABI makes compute pluggable. The engine picks automatically, and every backend reproduces the same logits **bit-for-bit**:
+
+| Backend | Where | How it engages |
+|---|---|---|
+| Rust AVX2 CPU | everywhere (built-in) | default |
+| OpenCL GPU | NVIDIA, AMD, Intel GPUs | automatic when a GPU is found; `DLLAMA_RUST_GPU=0` to disable |
+| Mojo CPU | Linux/WSL | drop `libdllama_mojo.so` next to the binary (see `rust/mojo/`) |
+
+Example A/B: `DLLAMA_KERNEL_LIB=libdllama_mojo.so dllama-rs chat ...` — the engine logs which backend it picked.
+
+## Building
+
+```bash
+cd rust
+cargo build --release
+```
+- **Windows**: MSVC toolchain (standard `rustup` install). If a freshly built `dllama-rs.exe` is blocked by Device Guard/Smart App Control, rebuild once — the hash changes.
+- **Linux/WSL**: same. For the optional Mojo backend: `rust/wsl/setup-mojo.sh` (rootless uv install, no sudo).
+- The C++ oracle binary (`dllama.exe`) is only needed for parity development — see `rust/DESIGN.md` §10.
+
+## Troubleshooting
+
+- **Big model is slow** — the 30B-class MoE needs ~17 GB of weights streamed per token; on a machine where it doesn't fit in RAM you are disk-bound. Use a cluster (RAM splits across nodes), or a smaller quant.
+- **`model is ambiguous`** — type a longer substring, or run `dllama-rs models` to see names.
+- **No nodes found** — workers must be running; check the discovery port (UDP 9990) isn't firewalled on your LAN.
+- **Different answer with the same seed?** Only `--temperature 0` (default) is deterministic; sampled runs vary by seed.
+
+## Project layout
+
+```
+rust/                  the Pyre engine (Rust)
+  DESIGN.md            full engineering log — architecture, wire protocol,
+                       and the validation record for every gate (G0–G7)
+  crates/dllama-*      kernel, IR, executors, loaders, cluster, API, CLI
+  mojo/                Mojo kernel backend + GPU kernels
+src/                   the C++ distributed-llama reference (parity oracle)
+models/                your models (git-ignored)
+```
+
+`rust/DESIGN.md` is the deep-dive: model-agnostic graph IR, the DLRS cluster
+protocol, quantization layouts, bit-exactness methodology, and the full gate
+history with measurements.
+
+## Credits & license
+
+MIT — same as upstream. Pyre is a derivative of
+[distributed-llama](https://github.com/b4rtaz/distributed-llama) by
+Bartłomiej Tadych (b4rtaz); the C++ tree in `src/` is kept as the numerical
+reference the Rust engine was validated against.

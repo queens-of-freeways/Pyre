@@ -1,0 +1,10 @@
+[package]
+name = "dllama-kernel"
+description = "Compute kernels + pluggable C-ABI backend table (Rust AVX2 reference; Mojo-ready)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dllama-quant = { path = "../dllama-quant" }
+libloading = "0.8"

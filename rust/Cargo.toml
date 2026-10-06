@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dllama-quant",
+    "crates/dllama-ir",
+    "crates/dllama-kernel",
+    "crates/dllama-net",
+    "crates/dllama-cli",
+    "crates/dllama-model",
+    "crates/dllama-tokenizer",
+    "crates/dllama-exec",
+    "crates/dllama-gguf",
+    "crates/dllama-cluster",
+    "crates/dllama-kernel-c",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
