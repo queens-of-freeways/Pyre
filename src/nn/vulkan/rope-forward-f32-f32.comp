@@ -1,0 +1,115 @@
+#version 450
+
+#define N_THREADS 256
+
+layout(local_size_x = N_THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint N_BATCHES = 32;
+
+struct BatchInfo {
+    uint inputOffset;
+    uint inputSizeX;
+    uint outputOffset;
+    uint outputSizeX;
+};
+
+struct RopeSlice {
+    uint qDim0;
+    uint qDimStart;
+    uint qDimEnd;
+    uint qShift;
+    uint kvDim;
+    uint kvDim0;
+    uint kvDimStart;
+    uint sliceDim;
+    uint seqLen;
+    uint headDim;
+    uint nKvHeads;
+    float ropeTheta;
+    // NnSize2D cacheSize;
+};
+
+layout(binding = 0) readonly buffer inputBuffer { float x[]; };
+layout(binding = 1) writeonly buffer outputBuffer { float y[]; };
+layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
+layout(binding = 3) readonly uniform configBuffer {
+    uint ropeType;
+    uint isQ;
+    uint positionPipeIndex;
+    uint ropeCacheBufferIndex;
+    float ropeScalingFactor;
+    float ropeScalingLowFreqFactor;
+    float ropeScalingHighFreqFactor;
+    uint ropeScalingOrigMaxSeqLen;
+    RopeSlice slice;
+};
+layout(binding = 4) readonly buffer positionsBuffer { float positions[]; };
+layout(binding = 5) readonly buffer ropeCacheBuffer { float ropeCache[]; };
+
+shared uint sharedPosition;
+
+void main() {
+    const uint threadIndex = gl_LocalInvocationID.x;
+    const uint batchIndex = gl_WorkGroupID.y;
+
+    if (threadIndex == 0) {
+        sharedPosition = uint(positions[batchIndex]);
+    }
+
+    barrier();
+
+    const uint position = sharedPosition;
+    const BatchInfo info = infos[batchIndex];
+
+    const uint xOffset = info.inputOffset;
+    const uint yOffset = info.outputOffset;
+    const uint dim0 = isQ == 1 ? slice.qDim0 : slice.kvDim0;
+
+    if (ropeType == 0 || ropeType == 2 /* Llama */) {
+        uint posOffset = position * slice.sliceDim;
+        if (isQ == 1) {
+            posOffset += slice.qShift;
+        }
+        const uint dim0Half = dim0 / 2;
+
+        for (uint i = threadIndex; i < dim0Half; i += N_THREADS) {
+            const uint j = i * 2;
+            const uint c = posOffset + j;
+
+            float fcr = ropeCache[c];
+            float fci = ropeCache[c + 1];
+            float v0 = x[xOffset + j];
+            float v1 = x[xOffset + j + 1];
+
+            const float x0 = fma(-v1, fci, v0 * fcr);
+            const float x1 = fma( v0, fci, v1 * fcr);
+
+            y[yOffset + j] = x0;
+            y[yOffset + j + 1] = x1;
+        }
+    } else if (ropeType == 1 /* Falcon */) {
+        const uint posOffset = position * slice.headDim;
+        const uint headDim = slice.headDim;
+        const uint headDimHalf = headDim / 2;
+        const uint nHeads0 = dim0 / headDim;
+
+        for (uint h = 0; h < nHeads0; h++) {
+            const uint o = h * headDim;
+
+            for (uint i = threadIndex; i < headDimHalf; i += N_THREADS) {
+                const uint c = posOffset + i;
+                float fcr = ropeCache[c];
+                float fci = ropeCache[c + headDimHalf];
+
+                float v0 = x[xOffset + o + i];
+                float v1 = x[xOffset + o + i + headDimHalf];
+
+                float x0 = v0 * fcr - v1 * fci;
+                float x1 = v0 * fci + v1 * fcr;
+
+                y[yOffset + o + i] = x0;
+                y[yOffset + o + i + headDimHalf] = x1;
+            }
+        }
+    }
+}

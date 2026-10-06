@@ -1,0 +1,127 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#define N_THREADS 256
+
+layout(local_size_x = N_THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint N_BATCHES = 32;
+
+struct BatchInfo {
+    uint inputOffset;
+    uint inputSizeX;
+    uint outputOffset;
+    uint outputSizeX;
+};
+
+layout(binding = 0) readonly buffer inputBuffer { float x[]; };
+layout(binding = 1) writeonly buffer outputBuffer { float y[]; };
+layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
+layout(binding = 3) readonly uniform configBuffer {
+    uint nHeads;
+    uint nHeads0;
+    uint nKvHeads;
+    uint headDim;
+    uint seqLen;
+    uint qSliceD0;
+    uint kvDim0;
+    uint positionPipeIndex;
+    uint queryBufferIndex;
+    uint keyCacheBufferIndex;
+    uint valueCacheBufferIndex;
+    uint attBufferIndex;
+};
+layout(binding = 4) readonly buffer positionsBuffer { float positions[]; };
+layout(binding = 5) readonly buffer queryBuffer { float query[]; };
+layout(binding = 6) readonly buffer keyCacheBuffer { float keyCache[]; };
+layout(binding = 7) readonly buffer valueCacheBuffer { float valueCache[]; };
+layout(binding = 8) buffer attBufferBuffer { float att[]; };
+
+shared uint sharedPosition;
+shared float sharedMaxScore;
+shared float temp[N_THREADS];
+
+void main() {
+    const uint threadIndex = gl_LocalInvocationID.x;
+    const uint batchIndex = gl_WorkGroupID.y;
+    const uint h = gl_WorkGroupID.x;
+
+    if (threadIndex == 0) {
+        sharedPosition = uint(positions[batchIndex]);
+    }
+
+    barrier();
+
+    const uint kvMul = nHeads / nKvHeads;
+    const uint headIndex = h / kvMul;
+    const float invHeadDimRoot = 1.0f / sqrt(float(headDim));
+
+    const BatchInfo info = infos[batchIndex];
+    const uint position = sharedPosition;
+
+    const uint attOffset = batchIndex * nHeads0 * seqLen + h * seqLen;
+    const uint qOffset = batchIndex * qSliceD0 + h * headDim;
+    const uint kvOffset = headIndex * headDim;
+    const uint yOffset = info.outputOffset + h * headDim;
+
+    float ms = -1e10f;
+    for (uint p = threadIndex; p <= position; p += N_THREADS) {
+        const uint kOffset = kvOffset + p * kvDim0;
+
+        float score = 0.0f;
+        for (uint i = 0; i < headDim; i++) {
+            score += query[qOffset + i] * keyCache[kOffset + i];
+        }
+        score *= invHeadDimRoot;
+        ms = max(ms, score);
+        att[attOffset + p] = score;
+    }
+
+    temp[threadIndex] = ms;
+
+    barrier();
+
+    [[unroll]] for (uint i = N_THREADS / 2; i > 0; i >>= 1) {
+        if (threadIndex < i)
+            temp[threadIndex] = max(temp[threadIndex], temp[threadIndex + i]);
+        barrier();
+    }
+
+    if (threadIndex == 0) {
+        sharedMaxScore = temp[0];
+    }
+
+    barrier();
+
+    const float maxScore = sharedMaxScore;
+
+    float s = 0.0f;
+    for (uint p = threadIndex; p <= position; p += N_THREADS) {
+        float v = exp(att[attOffset + p] - maxScore);
+        att[attOffset + p] = v;
+        s += v;
+    }
+
+    temp[threadIndex] = s;
+    barrier();
+
+    [[unroll]] for (uint i = N_THREADS / 2; i > 0; i >>= 1) {
+        if (threadIndex < i)
+            temp[threadIndex] += temp[threadIndex + i];
+        barrier();
+    }
+
+    const float yScale = 1.0f / temp[0];
+
+    for (uint i = threadIndex; i < headDim; i += N_THREADS) {
+        float sum = 0.0f;
+        const uint vOffset = kvOffset + i;
+        for (uint p = 0; p <= position; p += 1) {
+            const float a = att[attOffset + p];
+            const float v = valueCache[vOffset + p * kvDim0];
+            sum += v * a;
+        }
+        y[yOffset + i] = sum * yScale;
+    }
+}

@@ -1,0 +1,28 @@
+[package]
+name = "dllama-cli"
+description = "dllama-rs: CLI for the Rust engine (bench, graph-dump)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dllama-quant = { path = "../dllama-quant" }
+dllama-ir = { path = "../dllama-ir" }
+dllama-kernel = { path = "../dllama-kernel" }
+dllama-net = { path = "../dllama-net" }
+dllama-model = { path = "../dllama-model" }
+dllama-tokenizer = { path = "../dllama-tokenizer" }
+dllama-exec = { path = "../dllama-exec" }
+dllama-gguf = { path = "../dllama-gguf" }
+dllama-cluster = { path = "../dllama-cluster" }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio-stream = "0.1"
+futures = "0.3"
+minijinja = "2"
+
+[[bin]]
+name = "dllama-rs"
+path = "src/main.rs"

@@ -1,0 +1,125 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+#define TILE_SIZE_X 2
+#define TILE_SIZE_D 8
+
+#define Q80_Q40_BLOCK_SIZE 32
+
+layout(local_size_x_id = 2, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint N_BATCHES = 32;
+layout(constant_id = 1) const uint N_Z = 1;
+layout(constant_id = 2) const uint N_THREADS = 32;
+
+struct BatchInfo {
+    uint inputOffset;
+    uint inputSizeX;
+    uint outputOffset;
+    uint outputSizeX;
+};
+
+struct BlockQ80 {
+    float16_t d;
+    int8_t qs[Q80_Q40_BLOCK_SIZE];
+};
+
+struct BlockQ40 {
+    float16_t d;
+    uint8_t qs[Q80_Q40_BLOCK_SIZE / 2];
+};
+
+layout(binding = 0) readonly buffer inputBuffer { BlockQ80 x[]; };
+layout(binding = 1) writeonly buffer outputBuffer { float y[]; };
+layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_Z * N_BATCHES]; };
+layout(binding = 3) readonly buffer weightBuffer { BlockQ40 weight[]; };
+layout(binding = 4) readonly uniform opConfigBuffer {
+    uint nExperts;
+    uint nActiveExperts;
+    uint activeExpertIndexesBufferIndex;
+};
+layout(binding = 5) readonly buffer activeExpertIndexesBuffer { float activeExpertIndexes[]; };
+
+shared float sums[N_THREADS * TILE_SIZE_D];
+
+void main() {
+    const uint threadIndex = gl_LocalInvocationID.x;
+    const uint workGroupIndex = gl_WorkGroupID.x;
+    const uint batchIndex = gl_WorkGroupID.y;
+    const uint zIndex = gl_WorkGroupID.z;
+
+    const uint b = zIndex * N_BATCHES + batchIndex;
+    const BatchInfo info = infos[b];
+
+    const uint expertIndex = nExperts == 0
+        ? 0
+        : uint(activeExpertIndexes[batchIndex * nActiveExperts + zIndex]);
+    const uint expertOffset = expertIndex * info.inputSizeX * info.outputSizeX;
+
+    const uint inputOffset = info.inputOffset;
+    const uint inputSizeX = info.inputSizeX;
+    const uint d = TILE_SIZE_D * workGroupIndex;
+
+    vec4 xTemp[Q80_Q40_BLOCK_SIZE / 4];
+
+    for (uint dt = 0; dt < TILE_SIZE_D; dt++) {
+        sums[threadIndex * TILE_SIZE_D + dt] = 0.0f;
+    }
+
+    [[unroll]] for (uint it = 0; it < TILE_SIZE_X; it++) {
+        const uint xi = inputOffset + threadIndex + it * N_THREADS;
+        const float xScale = float(x[xi].d);
+        [[unroll]] for (uint j = 0; j < Q80_Q40_BLOCK_SIZE / 4; j++) {
+            xTemp[j] = vec4(
+                x[xi].qs[j * 2],
+                x[xi].qs[j * 2 + Q80_Q40_BLOCK_SIZE / 2],
+                x[xi].qs[j * 2 + 1],
+                x[xi].qs[j * 2 + 1 + Q80_Q40_BLOCK_SIZE / 2]
+            );
+        }
+
+        [[unroll]] for (uint dt = 0; dt < TILE_SIZE_D; dt++) {
+            const uint wi = expertOffset + (d + dt) * inputSizeX + threadIndex + it * N_THREADS;
+            const BlockQ40 wBlock = weight[wi];
+
+            float s = 0.0f;
+            [[unroll]] for (uint j = 0; j < Q80_Q40_BLOCK_SIZE / 4; j++) {
+                uint w0 = wBlock.qs[j * 2];
+                uint w1 = wBlock.qs[j * 2 + 1];
+                s += dot(xTemp[j], vec4(
+                    int(w0 & 0xFu) - 8,
+                    int(w0 >> 4) - 8,
+                    int(w1 & 0xFu) - 8,
+                    int(w1 >> 4) - 8
+                ));
+            }
+            sums[threadIndex * TILE_SIZE_D + dt] += s * xScale * wBlock.d;
+        }
+    }
+
+    barrier();
+
+    const uint outputOffset = infos[b].outputOffset; // Hoisting fix for Raspberry PI
+
+    uint i = N_THREADS;
+    while (i % 2 == 0) {
+        i >>= 1;
+        for (uint dt = 0; dt < TILE_SIZE_D; dt++) {
+            if (threadIndex < i) {
+                sums[threadIndex * TILE_SIZE_D + dt] += sums[(threadIndex + i) * TILE_SIZE_D + dt];
+            }
+        }
+        barrier();
+    }
+    for (uint dt = threadIndex; dt < TILE_SIZE_D; dt += N_THREADS) {
+        float s = 0.0;
+        for (uint j = 1; j <= i; j++) {
+            s += sums[(j - 1) * TILE_SIZE_D + dt];
+        }
+        y[outputOffset + d + dt] = float(s);
+    }
+}

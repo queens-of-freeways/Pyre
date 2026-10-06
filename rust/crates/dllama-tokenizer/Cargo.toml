@@ -1,0 +1,6 @@
+[package]
+name = "dllama-tokenizer"
+description = "Loader + BPE encoder/decoder for the .t tokenizer format (port of src/tokenizer.cpp)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
