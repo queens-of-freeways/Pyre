@@ -376,6 +376,7 @@ fn help() -> i32 {
     println!("  dllama-rs chat       --model <f> [--tokenizer <f>]");
     println!("  dllama-rs gguf-check --model <f>   | gguf-to-m | m-to-gguf");
     println!("  dllama-rs perplexity-dist --model <f> --workers auto --prompt <text>   (or: --workers host:port ...)
+  dllama-rs inference-dist  --model <f> --workers auto --prompt <text> --steps N   distributed generation
   dllama-rs nodes [--timeout 1000]        list discovered cluster nodes");
     println!("  dllama-rs bench matmul [--n 4096] [--k 4096]   | bench quant");
     println!("  dllama-rs graph-dump --model <preset> --nodes <n>");
@@ -406,6 +407,7 @@ fn main() {
             "gguf-to-m" => g1::run_gguf_to_m(&args[1..]),
             "m-to-gguf" => g1::run_m_to_gguf(&args[1..]),
             "perplexity-dist" => g1::run_distributed_perplexity(&args[1..]),
+            "inference-dist" => g1::run_distributed_inference(&args[1..]),
             "chat" => g1::run_chat(&args[1..]),
             "serve" => {
                 g1::apply_threads_flag(&args[1..]);

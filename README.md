@@ -81,9 +81,14 @@ Every machine runs a worker; the root discovers them automatically (UDP broadcas
 dllama-rs worker                     # listens + answers discovery probes
 
 # on the root machine:
-dllama-rs nodes                      # see who's out there
-dllama-rs perplexity-dist --workers auto --model <name> --prompt "text"
+dllama-rs nodes                                                    # see who's out there
+dllama-rs perplexity-dist --workers auto --model <name> --prompt "text"   # ppl
+dllama-rs inference-dist  --workers auto --model <name> \
+    --prompt "The capital of France is" --steps 64                  # generation
 ```
+Generation works on the cluster too: the root samples each token and
+broadcasts it, so every node's KV cache stays identical — same sampler
+flags (`--temperature`, `--seed`, ...) as local inference.
 
 Tensor-parallel sharding: each node holds 1/n of the weights and activations; nodes sync activations per layer over TCP. Requirements: node count is a power of two, and ≤ the model's KV-head count (GQA). With n nodes, a machine needs ~1/n the RAM.
 

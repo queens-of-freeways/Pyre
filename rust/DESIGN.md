@@ -985,6 +985,25 @@ one entry); e2e: worker started with defaults → `nodes` found it →
 `perplexity-dist --workers auto` connected and produced the known 2-node
 ppl 7.727886.
 
+## 10.19 G6.5 results (recorded 2026-10-05 — distributed inference)
+
+`inference-dist` completes the cluster story: generation, not just
+perplexity, runs across nodes.
+
+- The root drives sampling; every generated token is broadcast to all
+  workers in the next control packet, so all KV caches stay identical.
+  Workers never need the tokenizer output — they just evaluate.
+- Same setup path as the ppl driver (meta + tensor-slice sync, ack), same
+  DLRS control packets; `--workers auto` (UDP discovery) works here too.
+- Sampler flags apply on the root (`--temperature`, `--top-p`, `--seed`).
+- Ends with a `batch_size: 0` stop packet — workers log "stop packet
+  received" and return to accept.
+
+Validation (2 localhost nodes, qwen3-0.6b q40, greedy): prompt of 5 tokens
+fed, 16 tokens generated coherently ("...capital of Italy is Rome..."),
+258 ms/tok (the 0.6B is overhead-dominated on loopback — distribution pays
+when a model doesn't fit in one machine's RAM, which is the 30B case).
+
 ## 11. Open questions / risks
 
 1. **Kernel performance parity**: llamafile sgemm is hand-tuned AVX2/NEON. G6

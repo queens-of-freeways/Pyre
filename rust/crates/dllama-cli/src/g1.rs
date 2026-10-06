@@ -991,6 +991,225 @@ pub fn run_distributed_perplexity(args: &[String]) -> i32 {
     0
 }
 
+
+/// Distributed generation (G6.5): the root drives sampling, every node keeps
+/// its KV cache in sync via the same control packets the perplexity driver
+/// uses. Workers just evaluate; only the root needs the tokenizer output.
+/// Usage: dllama-rs inference-dist --model <name> --prompt "..." --steps N
+///        [--workers auto|host:port ...] [--temperature ...] [--seed ...]
+pub fn run_distributed_inference(args: &[String]) -> i32 {
+    apply_threads_flag(args);
+    let model_path = match flag(args, "--model") {
+        Some(p) => p.to_string(),
+        None => { eprintln!("--model is required"); return 1; }
+    };
+    let tokenizer_path = flag(args, "--tokenizer").unwrap_or_default().to_string();
+    let prompt = flag(args, "--prompt").unwrap_or("").to_string();
+    let steps: usize = flag(args, "--steps").unwrap_or("64").parse().unwrap_or(64);
+    let max_seq_len: u32 = flag(args, "--max-seq-len").unwrap_or("0").parse().unwrap_or(0);
+    let workers_str = flag(args, "--workers").unwrap_or("").to_string();
+    let worker_addrs: Vec<(String, u16)> = if workers_str.trim() == "auto" {
+        let timeout: u64 = flag(args, "--timeout").and_then(|v| v.parse().ok()).unwrap_or(1000);
+        match dllama_cluster::discover_nodes(timeout) {
+            Ok(list) if list.is_empty() => {
+                eprintln!("no nodes discovered — start workers (dllama-rs worker) or pass --workers host:port");
+                return 1;
+            }
+            Ok(list) => {
+                println!("auto-discovered {} node(s)", list.len());
+                for n in &list { println!("   {n}"); }
+                list.iter().filter_map(|a| {
+                    let (h, p) = a.rsplit_once(':')?;
+                    Some((h.to_string(), p.parse().ok()?))
+                }).collect()
+            }
+            Err(e) => { eprintln!("discovery failed: {e}"); return 1; }
+        }
+    } else {
+        workers_str.split_whitespace().filter_map(|a| {
+            let (h, p) = a.rsplit_once(':')?;
+            Some((h.to_string(), p.parse().ok()?))
+        }).collect()
+    };
+    if prompt.is_empty() || worker_addrs.is_empty() {
+        eprintln!("--prompt and --workers are required");
+        return 1;
+    }
+    let n_nodes = worker_addrs.len() as u32 + 1;
+
+    // open model + validate sharding (same setup shape as the ppl driver)
+    let source = match open_model(&model_path, max_seq_len) {
+        Ok(f) => f,
+        Err(e) => { eprintln!("error: {e}"); return 1; }
+    };
+    let meta = match source.meta(max_seq_len) {
+        Ok(m) => m,
+        Err(e) => { eprintln!("error: {e}"); return 1; }
+    };
+    if let Err(e) = dllama_ir::check_sharding(&meta, n_nodes) {
+        eprintln!("error sharding: {e}");
+        return 1;
+    }
+    let weights = match source.weights() {
+        Ok(w) => w,
+        Err(e) => { eprintln!("error: {e}"); return 1; }
+    };
+    println!("{n_nodes} nodes (1 root + {} workers)", worker_addrs.len());
+
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    let mut worker_streams: Vec<TcpStream> = Vec::with_capacity(worker_addrs.len());
+    for (i, (host, port)) in worker_addrs.iter().enumerate() {
+        let node_index = i as u32 + 1;
+        let mut stream = match TcpStream::connect(format!("{host}:{port}")) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("error connect {host}:{port}: {e}"); return 1; }
+        };
+        if stream.write_all(&dllama_cluster::MAGIC).is_err()
+            || stream.write_all(&dllama_cluster::PROTOCOL_VERSION.to_le_bytes()).is_err() {
+            eprintln!("handshake failed for {host}:{port}");
+            return 1;
+        }
+        dllama_cluster::write_meta(&mut stream, &meta).unwrap();
+        stream.write_all(&node_index.to_le_bytes()).unwrap();
+        stream.write_all(&n_nodes.to_le_bytes()).unwrap();
+
+        let shard = match dllama_ir::shard::shard_node(&meta, n_nodes, node_index) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("error: {e}"); return 1; }
+        };
+        let slices = match dllama_cluster::node_tensor_slices(&meta, &weights, &shard) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("error: {e}"); return 1; }
+        };
+        stream.write_all(&(slices.len() as u32).to_le_bytes()).unwrap();
+        for (name, kind, bytes) in &slices {
+            stream.write_all(&(name.len() as u64).to_le_bytes()).unwrap();
+            stream.write_all(name.as_bytes()).unwrap();
+            let kid = match kind {
+                dllama_model::QuantKind::F32 => 0u8,
+                dllama_model::QuantKind::F16 => 1,
+                dllama_model::QuantKind::DllamaQ40 => 2,
+                dllama_model::QuantKind::GgufQ4_0 => 3,
+                dllama_model::QuantKind::GgufQ8_0 => 4,
+                dllama_model::QuantKind::GgufQ4K => 5,
+                dllama_model::QuantKind::GgufQ6K => 6,
+            };
+            stream.write_all(&[kid]).unwrap();
+            stream.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();
+            stream.write_all(bytes).unwrap();
+        }
+        let mut ack = [0u8; 4];
+        if stream.read_exact(&mut ack).is_err() {
+            eprintln!("no ack from {host}:{port}");
+            return 1;
+        }
+        println!("worker {node_index} at {host}:{port} ({:?} tensors)", slices.len());
+        worker_streams.push(stream);
+    }
+
+    // root's own shard (owned arena, leaked — CLI lifetime)
+    let root_shard = match dllama_ir::shard::shard_node(&meta, n_nodes, 0) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("error: {e}"); return 1; }
+    };
+    let root_slices = match dllama_cluster::node_tensor_slices(&meta, &weights, &root_shard) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("error: {e}"); return 1; }
+    };
+    let mut map: HashMap<String, dllama_model::Tensor> = HashMap::with_capacity(root_slices.len());
+    for (name, kind, bytes) in root_slices {
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        map.insert(name, dllama_model::Tensor { kind, bytes: leaked });
+    }
+    let root_weights = dllama_model::Weights::from_map(map);
+    let mut inf = match dllama_exec::Inference::new_distributed(&meta, &root_weights, Some(root_shard), true) {
+        Ok(i) => i,
+        Err(e) => { eprintln!("error: {e}"); return 1; }
+    };
+
+    let tokenizer = match source.tokenizer(if tokenizer_path.is_empty() { None } else { Some(&tokenizer_path) }) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("error: {e}"); return 1; }
+    };
+    let mut sampler = crate::sampler::sampler_from_args(args);
+    let input = match tokenizer.encode(&prompt, true, true) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("error: {e}"); return 1; }
+    };
+    let n = input.len();
+    let seq_len = meta.seq_len as usize;
+    println!("Evaluating {n} prompt tokens ({n_nodes} nodes)...");
+
+    // one distributed forward: broadcast the control packet + root forward
+    macro_rules! dist_forward {
+        ($tok:expr, $pos:expr) => {{
+            let pkt = dllama_cluster::ControlPacket { token: $tok, position: $pos, batch_size: 1 };
+            let pkt_bytes = pkt.encode();
+            for w in &mut worker_streams {
+                if w.write_all(&pkt_bytes).is_err() {
+                    eprintln!("worker disconnected");
+                    return 1;
+                }
+            }
+            let mut sctx = dllama_exec::distributed::SyncCtx::Root { workers: &mut worker_streams };
+            inf.forward_with_stream($tok, $pos, &mut sctx)
+        }};
+    }
+
+    // feed the prompt (positions 0..n-1); the last forward's logits start
+    let mut logits: Vec<f32> = Vec::new();
+    let t0 = std::time::Instant::now();
+    for pos in 0..n {
+        let token = input[pos] as u32;
+        logits = match dist_forward!(token, pos as u32) {
+            Ok(l) => l.to_vec(),
+            Err(e) => { eprintln!("error: {e}"); return 1; }
+        };
+    }
+    let mut pos = n;
+    let mut token = sampler.next(&logits);
+
+    // generation loop — each sampled token is broadcast to every node so all
+    // KV caches stay identical; only the root samples and decodes.
+    let mut state = dllama_tokenizer::DecodeState::default();
+    let mut generated = 0usize;
+    while pos < seq_len && generated < steps {
+        if tokenizer.is_eos(token) { break; }
+        if let Some(piece) = tokenizer.decode(&mut state, token) {
+            print!("{piece}");
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        }
+        let tok32 = token as u32;
+        logits = match dist_forward!(tok32, pos as u32) {
+            Ok(l) => l.to_vec(),
+            Err(e) => { eprintln!("error: {e}"); return 1; }
+        };
+        pos += 1;
+        generated += 1;
+        let next = sampler.next(&logits);
+        if tokenizer.is_eos(next) { break; }
+        token = next;
+    }
+    println!();
+    let dt = t0.elapsed().as_secs_f64();
+    let eval_s = dt - generated as f64 * 0.0; // (prompt+gen share the clock; report total)
+    println!("\nPrediction ({n_nodes} nodes)");
+    if generated > 0 {
+        println!("   tokens/s: {:.2} ({:.0} ms/tok)", generated as f64 / eval_s, eval_s * 1000.0 / generated as f64);
+    }
+    println!("   prompt tokens: {n}, generated: {generated}");
+
+    // clean stop so workers end their session gracefully (batch_size: 0)
+    let stop = dllama_cluster::ControlPacket { token: 0, position: pos as u32, batch_size: 0 };
+    let stop_bytes = stop.encode();
+    for w in &mut worker_streams {
+        let _ = w.write_all(&stop_bytes);
+    }
+    0
+}
+
 /// Interactive chat: ChatML template, GGUF tokenizer, streaming output.
 pub fn run_chat(args: &[String]) -> i32 {
     apply_threads_flag(args);
