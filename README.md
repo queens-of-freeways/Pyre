@@ -94,6 +94,15 @@ Tensor-parallel sharding: each node holds 1/n of the weights and activations; no
 
 Notes: same-machine roots find workers on loopback (works across WSL2); remote workers answer from their LAN IP. Explicit addresses still work: `--workers 192.168.1.10:9998 192.168.1.11:9998`.
 
+**Direct cable between two nodes:** if the machines are close enough, a plain Ethernet cable is the fastest path (Raspberry Pi ports auto-negotiate — no crossover cable needed). Give the link static addresses once, e.g. with NetworkManager:
+
+    sudo nmcli con add type ethernet con-name direct ifname eth0 \
+         ipv4.method manual ipv4.addresses 10.0.0.1/24    # node 1
+    sudo nmcli con add type ethernet con-name direct ifname eth0 \
+         ipv4.method manual ipv4.addresses 10.0.0.2/24    # node 2
+
+then point the root at the cable address (`--workers 10.0.0.2:9998`). On our Pi cluster this cut generation from 5355 to 3781 ms/token (-29%) and the per-run weight stream from ~44 s to ~4 s (117 MB/s over the cable vs 13 MB/s over WiFi), with bit-identical results (ppl 7.727886 on both paths). Auto-discovery still works (`--workers auto`) — but its probe follows the default route, so it may report the WiFi address; use explicit `--workers` when you want the cable path.
+
 ## API server
 
 ```bash

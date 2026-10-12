@@ -988,6 +988,14 @@ pub fn run_distributed_perplexity(args: &[String]) -> i32 {
     let ppl = (-(total_log_prob / (n - 1) as f32)).exp();
     println!("\nResults ({n_nodes} nodes)");
     println!("   perplexity: {:.6} (lower = better)", ppl);
+
+    // clean stop so workers end their session gracefully (batch_size: 0)
+    let stop = dllama_cluster::ControlPacket { token: 0, position: n.saturating_sub(1) as u32, batch_size: 0 };
+    let stop_bytes = stop.encode();
+    for w in &mut worker_streams {
+        use std::io::Write;
+        let _ = w.write_all(&stop_bytes);
+    }
     0
 }
 

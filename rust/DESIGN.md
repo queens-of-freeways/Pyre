@@ -1032,6 +1032,96 @@ RAM fitting: KV = layers × 2 × seq_len × kv_dim × 4 B — the 0.6B at its
 native 40960 seq is 9.4 GB/node; `--max-seq-len 2048` brings it to 470 MB,
 which is what let the 3 GB node participate.
 
+## 10.21 G6.7 results (recorded 2026-10-12 — direct Ethernet link between nodes)
+
+The two Pi 5 nodes are now connected with a direct Ethernet cable (Pi ports
+do auto-MDIX, so a regular patch cable works). Goal: give the cluster a
+fast, low-latency path that does not depend on the WiFi AP, re-validate
+bit-exactness on it, measure the win, and re-test auto discovery outside
+the lab (the AP ate broadcasts last time, 10.18/10.20).
+
+### Link setup (persistent, NetworkManager)
+
+eth0 had carrier (1000 Mbps negotiated) but no address; NetworkManager
+showed it `disconnected`. One profile per node — survives reboot, the
+WiFi default route stays untouched:
+
+    sudo nmcli connection add type ethernet con-name direct ifname eth0 \
+         ipv4.method manual ipv4.addresses 10.0.0.1/24        # S1
+    sudo nmcli connection add type ethernet con-name direct ifname eth0 \
+         ipv4.method manual ipv4.addresses 10.0.0.2/24        # S2
+    sudo nmcli connection up direct
+
+### Link measurements (S1 -> S2)
+
+| path | TCP throughput | ping RTT |
+|---|---|---|
+| direct cable | 117 MB/s (~936 Mbps, near GbE line rate) | ~0.25 ms |
+| WiFi via AP   | 13.1 MB/s                              | ~10 ms (avg 9.88) |
+
+### Validation over the cable
+
+- perplexity-dist over 10.0.0.2: **ppl 7.727886** — identical to WiFi and
+  to the x86-64 runs (5th topology confirmation; the transport changes
+  nothing about the math, as designed).
+- inference-dist, same prompt/steps, same session, WiFi vs cable:
+  **5355 -> 3781 ms/tok** (0.19 -> 0.26 tok/s, -29% per token); wall time
+  2m47.8 -> 1m35.4 (-43%, including the per-run weight stream: ~480 MB of
+  shards took ~44 s over WiFi, ~4 s over cable — visible in the ppl runs
+  too: 76 s when the auto-picked WiFi address was used vs 32 s via cable).
+- Generated text identical on both paths (greedy; sampling is seeded).
+
+### Auto discovery on the real cluster — now working
+
+`dllama-rs nodes` found the worker 2/2 attempts, and a full
+`perplexity-dist --workers auto` run completed end-to-end (ppl 7.727886).
+Findings:
+
+- Linux sends limited broadcast (255.255.255.255) out the **default-route
+  interface only** — with the cable up but the default route still via
+  wlan0, the probe egresses wlan0, and the AP delivered it this time. Last
+  session's "AP blocks broadcast" is best read as "AP broadcast handling is
+  inconsistent"; the reliable paths remain explicit `--workers`, or a
+  probe that enumerates local interfaces (future work).
+- The worker is found via its WiFi address even though a cable exists
+  (the reply comes from whichever interface received the probe). Explicit
+  `--workers 10.0.0.2:9998` pins the cable path when you want it.
+
+### Protocol wart found and fixed (both sides)
+
+perplexity-dist closed worker TCP connections without a stop packet
+(inference-dist sends one), so every ppl run ended with the worker
+logging `worker session ended: failed to fill whole buffer` (std's
+read_exact EOF message) — benign, but indistinguishable from real errors.
+Fixed both directions:
+
+- `g1.rs`: perplexity-dist now sends the stop packet (batch_size 0) after
+  printing results, matching inference-dist.
+- `dllama-cluster`: the worker reads the first control byte separately; a
+  clean EOF at a packet boundary is now a normal session end
+  (`worker: root disconnected (no stop packet)`), while a mid-packet EOF
+  stays a protocol error.
+
+Deployed to both nodes (2-file sftp + `~/.cargo/bin/cargo build --release`,
+~29 s incremental each) and re-verified over the cable: ppl 7.727886
+unchanged, worker log ends `worker: stop packet received`.
+
+### Traps (deployment tooling)
+
+- paramiko `exec_command` + `setsid nohup ... &`: never read that
+  channel's output — the detached process never closes it and the read
+  hangs (hit as a 900 s PipeTimeout). Fire-and-forget, then verify
+  listening on a separate channel.
+- Non-interactive SSH shells do not source the rustup PATH: use
+  `~/.cargo/bin/cargo` explicitly (bare `cargo` = command not found).
+- Measuring TCP throughput: `send()` can return partial writes — use
+  `sendall`, and trust the receiver's bytes/wall-clock number.
+
+Scripts: `rust/wsl/eth_recon.py` (link diagnostics), `eth_link.py`
+(NM profile + ping + bandwidth), `eth_cluster.py` (cable validation
+suite), `eth_polish.py` (deploy changed files + rebuild + verify).
+All read credentials from `NODE_PASS` in the environment.
+
 ## 11. Open questions / risks
 
 1. **Kernel performance parity**: llamafile sgemm is hand-tuned AVX2/NEON. G6

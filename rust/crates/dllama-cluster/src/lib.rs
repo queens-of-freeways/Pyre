@@ -601,7 +601,18 @@ fn worker_session(stream: &mut TcpStream) -> Result<(), String> {
     // forward loop
     loop {
         let mut pkt = [0u8; 12];
-        stream.read_exact(&mut pkt).map_err(|e| e.to_string())?;
+        // Read the first control byte separately: a clean EOF here (the root
+        // closed the connection at a packet boundary) is a normal session
+        // end, not a protocol error. A mid-packet EOF stays an error below.
+        match stream.read(&mut pkt[..1]) {
+            Ok(0) => {
+                println!("🔌 worker: root disconnected (no stop packet)");
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        stream.read_exact(&mut pkt[1..]).map_err(|e| e.to_string())?;
         let cp = ControlPacket::decode(&pkt).ok_or("short control packet")?;
         if cp.batch_size == 0 {
             println!("👋 worker: stop packet received");
