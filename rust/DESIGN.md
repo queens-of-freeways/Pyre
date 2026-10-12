@@ -1004,6 +1004,34 @@ fed, 16 tokens generated coherently ("...capital of Italy is Rome..."),
 258 ms/tok (the 0.6B is overhead-dominated on loopback — distribution pays
 when a model doesn't fit in one machine's RAM, which is the 30B case).
 
+## 10.20 G6.6 results (recorded 2026-10-12 — real 2-node ARM SBC cluster)
+
+The first test on real cluster hardware: two Raspberry-Pi-class aarch64
+nodes (Debian 13, 4 cores each, 7 GB / 3 GB RAM, no GPU, WiFi LAN).
+
+Setup per node (no sudo anywhere): rustup install → source tarball
+(158 KB) uploaded → `cargo build --release` (~70 s each, aarch64 clean —
+the AVX2-free fallback paths all compile and engage; `[kernel-gpu]` reports
+OpenCL unavailable and degrades silently).
+
+| Test (S1 root, S2 worker, 0.6B q40, --max-seq-len 2048) | Result |
+|---|---|
+| `perplexity-dist --workers <S2>:9998` | **ppl 7.727886 — identical to the Windows 2-node value**; the aarch64 scalar fallbacks match the x86-64 AVX2 path to 6 decimals (same kernel code paths, same float chains) |
+| `inference-dist --workers ... --steps 24` | 24 coherent, factual tokens ("Rome. The capital of Spain is Madrid. ...") at 5.4 s/tok (4 ARM cores, WiFi per-token sync) |
+| worker lifecycle | session 1 (ppl) ended cleanly → accepted session 2 (inference) → `stop packet received` ✓ |
+
+**Real-network finding:** UDP discovery found nothing — this AP suppresses
+`255.255.255.255` broadcasts between clients (common on WiFi). Explicit
+`--workers host:port` works everywhere; a follow-up is probing the
+subnet-directed broadcast (e.g. 192.168.0.255) which many APs forward.
+**Operational note for remote orchestration:** background workers need
+`setsid nohup ... < /dev/null &` when launched over SSH, or the channel
+close kills them.
+
+RAM fitting: KV = layers × 2 × seq_len × kv_dim × 4 B — the 0.6B at its
+native 40960 seq is 9.4 GB/node; `--max-seq-len 2048` brings it to 470 MB,
+which is what let the 3 GB node participate.
+
 ## 11. Open questions / risks
 
 1. **Kernel performance parity**: llamafile sgemm is hand-tuned AVX2/NEON. G6
