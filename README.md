@@ -123,7 +123,7 @@ Pyre's kernel ABI makes compute pluggable. The engine picks automatically, and e
 |---|---|---|
 | Rust AVX2 CPU | everywhere (built-in) | default |
 | OpenCL GPU | NVIDIA, AMD, Intel GPUs | automatic when a GPU is found; `DLLAMA_RUST_GPU=0` to disable |
-| Mojo CPU | Linux/WSL | drop `libdllama_mojo.so` next to the binary (see `rust/mojo/`) |
+| Mojo CPU | Linux/WSL, x86-64 & aarch64 (Pi 5 cluster validated) | drop `libdllama_mojo.so` next to the binary (see `rust/mojo/`) |
 
 Example A/B: `DLLAMA_KERNEL_LIB=libdllama_mojo.so dllama-rs chat ...` — the engine logs which backend it picked.
 
@@ -134,7 +134,7 @@ cd rust
 cargo build --release
 ```
 - **Windows**: MSVC toolchain (standard `rustup` install). If a freshly built `dllama-rs.exe` is blocked by Device Guard/Smart App Control, rebuild once — the hash changes.
-- **Linux/WSL**: same. For the optional Mojo backend: `rust/wsl/setup-mojo.sh` (rootless uv install, no sudo).
+- **Linux/WSL**: same. For the optional Mojo backend: `rust/wsl/setup-mojo.sh` (rootless uv install, no sudo — works on aarch64 too, validated on a Raspberry Pi 5 cluster).
 - The C++ oracle binary (`dllama.exe`) is only needed for parity development — see `rust/DESIGN.md` §10.
 
 ## Troubleshooting

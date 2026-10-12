@@ -475,7 +475,7 @@ def dllama_kernels_abi_version() abi("C") -> UInt32:
 def dllama_kernels_name() abi("C") -> Pointer[Scalar[DType.int8], ImmStaticOrigin]:
     initialize_runtime()
     # StringLiteral is_idx NUL-terminated by contract (stdlib docs)
-    return "mojo-1.1 (wsl)".as_c_string_span().ptr()
+    return "mojo-1.1".as_c_string_span().ptr()
 
 
 @export

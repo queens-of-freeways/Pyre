@@ -32,7 +32,7 @@ without this flag the K-quant matmuls drift by 1 ULP (see DESIGN.md §10.10).
 
 ```sh
 DLLAMA_KERNEL_LIB=./libdllama_mojo.so dllama-rs perplexity --model ... --prompt ...
-# stderr: [kernel] backend "mojo-1.1 (wsl)" loaded from ... (ABI v1)
+# stderr: [kernel] backend "mojo-1.1" loaded from ... (ABI v1)
 ```
 
 ## GPU kernels (`gpu_kernels.mojo`)
@@ -56,3 +56,9 @@ so a `SIMD[DType.float32, 8]` port can preserve bit-exactness).
 
 Windows: compile the same file with a future Windows Mojo toolchain
 (`mojo build --emit shared-lib` → `dllama_mojo.dll`); no engine change needed.
+
+**linux-aarch64**: Mojo 1.1 ships aarch64 Linux wheels — the same recipe
+(uv install + `mojo build --emit shared-lib --fp-mode contract=off`)
+builds the plugin and the engine auto-loads it. Validated bit-exact on the
+Raspberry Pi 5 cluster (both nodes run Mojo by default now), 2026-10-12 —
+see DESIGN.md 10.22.

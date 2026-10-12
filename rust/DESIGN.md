@@ -1122,6 +1122,67 @@ Scripts: `rust/wsl/eth_recon.py` (link diagnostics), `eth_link.py`
 suite), `eth_polish.py` (deploy changed files + rebuild + verify).
 All read credentials from `NODE_PASS` in the environment.
 
+## 10.22 G6.8 results (recorded 2026-10-12 — Mojo backend on the ARM cluster)
+
+Goal: make the Mojo kernel backend actually run on the real cluster.
+
+### Toolchain: Mojo 1.1.0 ships linux-aarch64 wheels
+
+Rootless uv install on both Pi 5s (~25 s each — same recipe as 10.10).
+`mojo build --emit shared-lib --fp-mode contract=off` compiles kernels.mojo
+for aarch64 (~75 KB plugin) and the engine auto-loads it from the exe dir
+(`libdllama_mojo.so`). The plugin is now the DEFAULT backend on the nodes;
+`DLLAMA_KERNEL_LIB=/nonexistent` (or removing the .so) restores the built-in
+Rust backend with a printed warning.
+
+### Validation — bit-exact on ARM, all anchors reproduced
+
+- single-node .m ppl: **7.913573**
+- single-node GGUF Q4_K_M ppl: **13.472507** (K-quant contraction trap clean)
+- 2-node ppl-dist over the cable: **7.727886** (worker log shows the Mojo
+  backend line — both nodes run Mojo)
+- 24-token inference-dist: coherent, identical text to the Rust runs
+
+### Perf (Pi 5, 4 threads each)
+
+- single-node generation: Mojo 552 ms/tok vs Rust scalar 160 ms/tok (3.4x)
+- 2-node over the cable: Mojo 4076 vs Rust 3781 ms/tok (~8% — sync and
+  thermal dominate the per-token cost)
+- Backend name string fixed to "mojo-1.1" (was a stale "(wsl)" tag).
+
+### Operational findings
+
+- The first 24-step dist run exceeded a 20-minute SSH read window: no
+  crash, no OOM, the worker even received the stop packet — the box was
+  simply slow. Cause: S1 SoC at 76-78 C under sustained load (Pi 5
+  soft-throttles approaching 85 C). Heatsinks/fans recommended for
+  sustained cluster use; re-runs on the warm box complete in ~100 s.
+- Wrap every long remote command in `timeout N ...; echo RC=$?` so an SSH
+  channel can never hang (RC=124 = hung process, 139 = segv, 0 = clean).
+- A/B switch: `DLLAMA_KERNEL_LIB=/nonexistent` forces the documented
+  fallback to the built-in Rust backend — no file juggling.
+
+### Model compatibility: Ornith-1.5-9B ("qwen35" hybrid) — not runnable today
+
+Investigated on request (dense 9B, MIT, strong agentic benchmarks):
+
+- config.json: Qwen3.5 lineage — 24 of 32 layers are `linear_attention`
+  (gated delta net), 8 full-attention; partial rotary 0.25; attention
+  output gating; mrope; a vision tower; 256K context. Verified in-file:
+  GGUF `general.architecture` = "qwen35" (ranged header fetch, no full
+  download).
+- Our graph IR has no GDN ops and no recurrent-state machinery — the
+  first requested model outside the dense/MoE llama-family envelope.
+  Support would need: a new op family with per-layer recurrent state
+  (conv state + delta-rule update), partial-rope, output gating; the
+  vision tower is separable (text-only GGUF builds exist). Recorded as
+  the leading "new architecture" candidate — a multi-session project.
+- GGUF format watch: this repo's files come from a newer writer that
+  emits 8-byte-wide string length fields in metadata and names (e.g.
+  key length 20 stored as `14 00 00 00 00 00 00 00`); our loader reads
+  u32 lengths and parses 2025-era files fine, but new-writer GGUFs will
+  need a loader update when we next touch GGUF code.
+
 ## 11. Open questions / risks
 
 1. **Kernel performance parity**: llamafile sgemm is hand-tuned AVX2/NEON. G6
