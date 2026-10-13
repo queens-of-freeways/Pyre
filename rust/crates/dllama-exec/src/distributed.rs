@@ -11,18 +11,62 @@ use dllama_ir::shard::NodeShard;
 use dllama_kernel::KvCache;
 use dllama_model::{QuantKind, Tensor, Weights};
 use dllama_quant::{dequantize_row_q80, q80_bytes, quantize_row_q80};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+
+/// The cluster's TCP wire, mirroring the original C++ `NnNetwork` transport
+/// choices (nn-network.cpp): TCP_NODELAY on every socket — the per-token
+/// sync packets are latency-critical — plus per-socket byte accounting
+/// (the C++ `sentBytes`/`recvBytes` counters surfaced by `getStats`).
+pub struct Wire {
+    stream: TcpStream,
+    sent: Cell<u64>,
+    recv: Cell<u64>,
+}
+
+impl Wire {
+    pub fn new(stream: TcpStream) -> Self {
+        // the original sets TCP_NODELAY on every socket (nn-network.cpp:55)
+        let _ = stream.set_nodelay(true);
+        Wire { stream, sent: Cell::new(0), recv: Cell::new(0) }
+    }
+
+    /// (bytes sent, bytes received) over this socket so far.
+    pub fn stats(&self) -> (u64, u64) {
+        (self.sent.get(), self.recv.get())
+    }
+}
+
+impl Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.stream.read(buf)?;
+        self.recv.set(self.recv.get() + n as u64);
+        Ok(n)
+    }
+}
+
+impl Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.stream.write(buf)?;
+        self.sent.set(self.sent.get() + n as u64);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
 
 /// Sync context: how Sync ops communicate.
 pub enum SyncCtx<'a> {
     /// single node: no sync needed (graph has no Sync ops)
     Single,
     /// worker: one stream to the root
-    Worker { stream: &'a mut TcpStream },
+    Worker { stream: &'a mut Wire },
     /// root: streams to all workers
-    Root { workers: &'a mut [TcpStream] },
+    Root { workers: &'a mut [Wire] },
 }
 
 // stream helpers (duplicated from dllama-cluster to avoid a circular dep)
@@ -54,7 +98,7 @@ trait Net: Read + Write {
         self.write_all(v).map_err(|e| e.to_string())
     }
 }
-impl Net for TcpStream {}
+impl Net for Wire {}
 
 impl<'w> Inference<'w> {
     /// Build a distributed executor (n_nodes > 1 graph with Sync ops).

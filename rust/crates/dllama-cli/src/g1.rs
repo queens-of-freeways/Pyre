@@ -857,13 +857,14 @@ pub fn run_distributed_perplexity(args: &[String]) -> i32 {
 
     // connect + send setup to each worker
     use std::net::TcpStream;
-    let mut worker_streams: Vec<TcpStream> = Vec::with_capacity(worker_addrs.len());
+    use dllama_exec::distributed::Wire;
+    let mut worker_streams: Vec<Wire> = Vec::with_capacity(worker_addrs.len());
     for (i, (host, port)) in worker_addrs.iter().enumerate() {
         let node_index = i as u32 + 1;
-        let mut stream = match TcpStream::connect(format!("{host}:{port}")) {
+        let mut stream = Wire::new(match TcpStream::connect(format!("{host}:{port}")) {
             Ok(s) => s,
             Err(e) => { eprintln!("🚨 connect {host}:{port}: {e}"); return 1; }
-        };
+        });
         // handshake
         use std::io::Write;
         if stream.write_all(&dllama_cluster::MAGIC).is_err()
@@ -989,6 +990,15 @@ pub fn run_distributed_perplexity(args: &[String]) -> i32 {
     println!("\nResults ({n_nodes} nodes)");
     println!("   perplexity: {:.6} (lower = better)", ppl);
 
+    let (mut io_sent, mut io_recv) = (0u64, 0u64);
+    for w in &worker_streams {
+        let (s, r) = w.stats();
+        io_sent += s;
+        io_recv += r;
+    }
+    println!("cluster io: sent {:.1} MB, recv {:.1} MB ({} worker(s))",
+             io_sent as f64 / 1e6, io_recv as f64 / 1e6, worker_streams.len());
+
     // clean stop so workers end their session gracefully (batch_size: 0)
     let stop = dllama_cluster::ControlPacket { token: 0, position: n.saturating_sub(1) as u32, batch_size: 0 };
     let stop_bytes = stop.encode();
@@ -1066,13 +1076,14 @@ pub fn run_distributed_inference(args: &[String]) -> i32 {
 
     use std::io::{Read, Write};
     use std::net::TcpStream;
-    let mut worker_streams: Vec<TcpStream> = Vec::with_capacity(worker_addrs.len());
+    use dllama_exec::distributed::Wire;
+    let mut worker_streams: Vec<Wire> = Vec::with_capacity(worker_addrs.len());
     for (i, (host, port)) in worker_addrs.iter().enumerate() {
         let node_index = i as u32 + 1;
-        let mut stream = match TcpStream::connect(format!("{host}:{port}")) {
+        let mut stream = Wire::new(match TcpStream::connect(format!("{host}:{port}")) {
             Ok(s) => s,
             Err(e) => { eprintln!("error connect {host}:{port}: {e}"); return 1; }
-        };
+        });
         if stream.write_all(&dllama_cluster::MAGIC).is_err()
             || stream.write_all(&dllama_cluster::PROTOCOL_VERSION.to_le_bytes()).is_err() {
             eprintln!("handshake failed for {host}:{port}");
@@ -1208,6 +1219,15 @@ pub fn run_distributed_inference(args: &[String]) -> i32 {
         println!("   tokens/s: {:.2} ({:.0} ms/tok)", generated as f64 / eval_s, eval_s * 1000.0 / generated as f64);
     }
     println!("   prompt tokens: {n}, generated: {generated}");
+
+    let (mut io_sent, mut io_recv) = (0u64, 0u64);
+    for w in &worker_streams {
+        let (s, r) = w.stats();
+        io_sent += s;
+        io_recv += r;
+    }
+    println!("cluster io: sent {:.1} MB, recv {:.1} MB ({} worker(s))",
+             io_sent as f64 / 1e6, io_recv as f64 / 1e6, worker_streams.len());
 
     // clean stop so workers end their session gracefully (batch_size: 0)
     let stop = dllama_cluster::ControlPacket { token: 0, position: pos as u32, batch_size: 0 };

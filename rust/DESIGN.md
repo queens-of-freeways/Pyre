@@ -1255,6 +1255,47 @@ GLM-5-Next, gpt-oss). BUT:
   open-source on GitHub (max/pipelines/architectures/qwen3_5) — a
   high-quality reference for the G7 (GDN) implementation when we do it.
 
+## 10.24 G6.10 results (recorded 2026-10-13 — transport parity with the original C++)
+
+Adopted the original dllama's transport design (nn-network.cpp) into the
+Rust cluster layer:
+
+- `Wire` (dllama-exec::distributed): the cluster's TCP stream wrapper —
+  **TCP_NODELAY on every socket** (C++ nn-network.cpp:55 — the per-token
+  sync packets are latency-critical) plus **per-socket byte accounting**
+  (the C++ `sentBytes`/`recvBytes` counters behind `getStats`).
+- `SyncCtx` now carries `Wire` (worker stream + root's worker slice), so
+  handshake, meta, weight stream, control packets and per-layer sync all
+  flow through the counters automatically.
+- End-of-run reporting: the root prints `cluster io: sent/recv ...`, each
+  worker session prints `worker io: sent/recv ...` — the measured
+  counterpart to graph-dump's sync-traffic estimate.
+- `write_meta`/`read_meta` are generic over the (now pub) `WireExt`.
+
+Deliberately NOT adopted, with reasons:
+
+- the 4 KB `MAX_CHUNK_SIZE` app-layer chunk loop — Rust's `write_all`
+  already loops on partial writes; the explicit 4 KB chunking is a
+  WinSock-era pattern with no effect on modern stacks.
+- `TCP_QUICKACK` (the C++ sets it on Linux) — not exposed by std, would
+  need a libc dep in a currently dep-free crate; with NODELAY set, the
+  Nagle/delayed-ACK interaction it guards against is already gone.
+  Revisit if we ever chase sub-ms sync on Linux.
+
+Validation: cargo test green; 2-node loopback ppl = **7.727886**
+(bit-exact anchor unchanged); io counters self-consistent — root
+sent 480.4 MB / recv 4.0 MB, worker mirrored (the 480 MB is the .m shard
+stream, ~0.2 MB/token is the per-layer sync for 22 forwards).
+
+Planned follow-up (the remaining original-design piece): **fused zero-copy
+shard streaming** — the C++ `NnRootWeightLoader` streams each tensor slice
+during the root's own model load through ONE reusable temp buffer, while
+we materialize `Vec` copies of every slice (and `Box::leak` the root's own
+copies). Porting that pattern removes ~1/n of the model from the root's
+heap (a 4B root drops ~1.25 GB resident) and is what unlocks 8B-class
+models on RAM-tight roots. Requires the `Box::leak(source)` lifetime
+pattern from ui.rs in the dist drivers.
+
 ## 11. Open questions / risks
 
 1. **Kernel performance parity**: llamafile sgemm is hand-tuned AVX2/NEON. G6

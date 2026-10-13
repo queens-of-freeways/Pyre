@@ -28,6 +28,7 @@ use dllama_quant::{dequantize_row_q80, q80_bytes, quantize_row_q80};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use dllama_exec::distributed::Wire;
 
 pub const MAGIC: [u8; 4] = *b"DLRS";
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -71,7 +72,7 @@ impl ControlPacket {
 // stream helpers
 // ---------------------------------------------------------------------------
 
-trait WireExt: Read + Write {
+pub trait WireExt: Read + Write {
     fn w_u32(&mut self, v: u32) -> Result<(), String> {
         self.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())
     }
@@ -119,12 +120,13 @@ trait WireExt: Read + Write {
 }
 
 impl WireExt for TcpStream {}
+impl WireExt for Wire {}
 
 // ---------------------------------------------------------------------------
 // ModelMeta wire format
 // ---------------------------------------------------------------------------
 
-pub fn write_meta(w: &mut TcpStream, m: &ModelMeta) -> Result<(), String> {
+pub fn write_meta<W: WireExt>(w: &mut W, m: &ModelMeta) -> Result<(), String> {
     w.w_str(&m.name)?;
     w.w_u32(match m.arch {
         Arch::Llama => 0,
@@ -166,7 +168,7 @@ pub fn write_meta(w: &mut TcpStream, m: &ModelMeta) -> Result<(), String> {
     Ok(())
 }
 
-pub fn read_meta(r: &mut TcpStream) -> Result<ModelMeta, String> {
+pub fn read_meta<W: WireExt>(r: &mut W) -> Result<ModelMeta, String> {
     let name = r.r_str()?;
     let arch = match r.r_u32()? {
         0 => Arch::Llama,
@@ -530,21 +532,24 @@ pub fn serve_worker(host: &str, port: u16) -> Result<(), String> {
     spawn_discovery_responder(port);
     println!("🎧 worker listening on {host}:{port}");
     for stream in listener.incoming() {
-        let mut stream = match stream {
+        let stream = match stream {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("accept error: {e}");
                 continue;
             }
         };
-        if let Err(e) = worker_session(&mut stream) {
+        let mut wire = Wire::new(stream);
+        if let Err(e) = worker_session(&mut wire) {
             eprintln!("🚨 worker session ended: {e}");
         }
+        let (s, r) = wire.stats();
+        println!("worker io: sent {:.1} MB, recv {:.1} MB", s as f64 / 1e6, r as f64 / 1e6);
     }
     Ok(())
 }
 
-fn worker_session(stream: &mut TcpStream) -> Result<(), String> {
+fn worker_session(stream: &mut Wire) -> Result<(), String> {
     // handshake
     let mut magic = [0u8; 4];
     stream.read_exact(&mut magic).map_err(|e| e.to_string())?;
@@ -627,6 +632,14 @@ trait ReadU8 {
 }
 
 impl ReadU8 for TcpStream {
+    fn read_u8(&mut self) -> Result<u8, String> {
+        let mut b = [0u8; 1];
+        self.read_exact(&mut b).map_err(|e| e.to_string())?;
+        Ok(b[0])
+    }
+}
+
+impl ReadU8 for Wire {
     fn read_u8(&mut self) -> Result<u8, String> {
         let mut b = [0u8; 1];
         self.read_exact(&mut b).map_err(|e| e.to_string())?;
