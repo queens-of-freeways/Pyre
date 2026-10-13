@@ -142,6 +142,7 @@ cargo build --release
 - **Big model is slow** — the 30B-class MoE needs ~17 GB of weights streamed per token; on a machine where it doesn't fit in RAM you are disk-bound. Use a cluster (RAM splits across nodes), or a smaller quant.
 - **`model is ambiguous`** — type a longer substring, or run `dllama-rs models` to see names.
 - **No nodes found** — workers must be running; check the discovery port (UDP 9990) isn't firewalled on your LAN.
+- **Cluster unstable under load (resets, link drops, spontaneous reboots — common on Raspberry Pis)** — that's usually marginal power, not software. Use proper 27 W (5 V/5 A) USB-C PD supplies and short thick cables for every node, and check `vcgencmd get_throttled` (anything nonzero = undervoltage occurred). Undervoltage also explains stalled big file transfers and Ethernet links that flap under load.
 - **Different answer with the same seed?** Only `--temperature 0` (default) is deterministic; sampled runs vary by seed.
 
 ## Project layout

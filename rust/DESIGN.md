@@ -1183,6 +1183,78 @@ Investigated on request (dense 9B, MIT, strong agentic benchmarks):
   u32 lengths and parses 2025-era files fine, but new-writer GGUFs will
   need a loader update when we next touch GGUF code.
 
+## 10.23 G6.9 results (recorded 2026-10-12 — Qwen3-4B on the cluster + power-delivery findings)
+
+Goal: prove the biggest cluster-feasible model (Qwen3-4B Q4_K_M, 2.32 GB).
+
+### Model acquisition lesson
+
+Sustained ~6 MB/s SFTP from the orchestration box to S1 got its SSH
+session reset after 20-350 MB (8/8 attempts; short bursts were fine).
+Fix pattern (now the standing rule): **never relay big files through the
+orchestration box — download on the node itself** with
+`curl -C - --retry 100 --retry-all-errors --speed-limit 100k --speed-time 60`,
+and only trust an existing partial after an md5 prefix check (the 1.80 GB
+partial from the failed SFTP attempts verified clean and was resumed).
+WiFi power_save also disabled via NetworkManager (`powersave 2` profile
+value) on both nodes as secondary hardening.
+
+### Qwen3-4B — engine side: fully proven (single-node)
+
+- Meta correct: Dim 2560 / HiddenDim 9728 / 36 layers / 32 q / 8 kv heads /
+  head_dim 128 — the model-agnostic loader + graph builder handled the
+  bigger dense shape with zero engine changes.
+- Greedy generation coherent: " Rome. The capital of Spain is Madrid.
+  The capital of" — RC=0, Rust backend, 4 threads.
+- Perf on S1 (Pi 5, scalar ARM): prompt eval 748 ms/tok, generation
+  **874 ms/tok** single-node (vs 160 ms/tok for the 0.6B — ~5.5x for
+  6.7x parameters, consistent with the memory-bound scalar path).
+- ppl anchor (1-node config): **20.033398** on the capitals prompt.
+  Note: the 0.6B gives 7.913573 on the same prompt — the 4B is the
+  thinking-tuned post-train and puts its probability mass elsewhere on
+  raw (untemplated) text over an 11-prediction sample; the coherent
+  generation is the correctness signal, not the raw ppl.
+
+### Qwen3-4B — 2-node: blocked by hardware (root cause found)
+
+The dist runs failed with connect timeouts to 10.0.0.2. Diagnosis:
+eth0 `carrier=0` on BOTH nodes, the link flapped on both ends at the same
+moment, and **S1 had spontaneously rebooted** right after the sustained
+2.5 GB WiFi download. `vcgencmd get_throttled` on S2:
+**0x50000 (under-voltage occurred + throttling occurred since boot)**,
+plus a dmesg under-voltage line. S1's flags are clean only because the
+reboot wiped them — the reboot is the brownout evidence.
+
+Root cause: **marginal power delivery under sustained load** (WiFi TX +
+CPU + GbE PHY). This single cause explains the whole day's flakiness:
+the SFTP resets, the Ethernet PHY link drops, and the spontaneous
+reboots. Fix (hardware, user hands): proper 27 W / 5 V 5 A USB-C PD
+supplies for BOTH Pis (official Pi 5 PSU), short thick USB-C cables, no
+daisy-chaining; reseat/replace the Ethernet cable after the power fix;
+verify with `vcgencmd get_throttled` staying 0x0 under load. At session
+end S1 was unreachable again (another reboot) — the cluster needs the
+power fix before further sustained runs.
+
+The 2-node 4B proof itself is one script away after the fix
+(`rust/wsl/qwen4b_runs.py`): the identical distributed path is already
+proven bit-exact end-to-end on the 0.6B over both cable and WiFi.
+
+### MAX (Modular) — can it run Ornith-1.5-9B?
+
+Checked against max.modular.com's supported-models table: **yes at the
+architecture level** — `Qwen3_5ForCausalLM` and
+`Qwen3_5ForConditionalGeneration` (Ornith's exact arch class) are both
+natively supported, and MAX also lists hybrid/SSM families (Lfm2,
+GLM-5-Next, gpt-oss). BUT:
+- MAX is a separate engine (not a component for Pyre) — serving Ornith
+  with it means abandoning this engine for that model.
+- Hardware reality: MAX strongly recommends datacenter GPUs (B200/H200/
+  H100 class); the CPU path exists but Ornith-9B is ~19 GB in bf16,
+  above this dev box's 16 GB RAM. It does not run on the Pis.
+- The valuable part for us: MAX's qwen3.5 pipeline implementation is
+  open-source on GitHub (max/pipelines/architectures/qwen3_5) — a
+  high-quality reference for the G7 (GDN) implementation when we do it.
+
 ## 11. Open questions / risks
 
 1. **Kernel performance parity**: llamafile sgemm is hand-tuned AVX2/NEON. G6
