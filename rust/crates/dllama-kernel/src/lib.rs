@@ -245,7 +245,16 @@ impl Kernels {
     }
 
     /// The static Rust reference backend (same functions the cdylib exports).
+    /// Announced wrapper: every engine start states which backend it picked
+    /// (mirrors the plugin load message at the successful-plugin path), so
+    /// the built-in default is never silent.
     pub fn builtin() -> Kernels {
+        let k = Self::builtin_quiet();
+        eprintln!("[kernel] backend: {}", k.name());
+        k
+    }
+
+    fn builtin_quiet() -> Kernels {
         Kernels {
             name: opencl::device_name()
                 .map(|d| format!("rust-avx2 + {d} (built-in)"))

@@ -1271,6 +1271,9 @@ Rust cluster layer:
   worker session prints `worker io: sent/recv ...` — the measured
   counterpart to graph-dump's sync-traffic estimate.
 - `write_meta`/`read_meta` are generic over the (now pub) `WireExt`.
+- Follow-up (same day): `Kernels::builtin()` now announces itself
+  (`[kernel] backend: rust-avx2 + opencl-gpu (built-in)`), mirroring the
+  plugin's load message — the OS-aware backend choice is never silent.
 
 Deliberately NOT adopted, with reasons:
 
