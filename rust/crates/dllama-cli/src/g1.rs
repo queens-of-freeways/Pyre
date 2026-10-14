@@ -64,10 +64,10 @@ pub fn open_model(path: &str, max_seq_len: u32) -> Result<ModelSource, String> {
 
 pub fn run_perplexity(args: &[String]) -> i32 {
     apply_threads_flag(args);
-    let model_path = match flag(args, "--model") {
-        Some(p) => p.to_string(),
-        None => {
-            eprintln!("--model is required");
+    let model_path = match resolve_model_arg(flag(args, "--model")) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
             return 1;
         }
     };
@@ -176,10 +176,10 @@ pub fn run_perplexity(args: &[String]) -> i32 {
 
 pub fn run_inference(args: &[String]) -> i32 {
     apply_threads_flag(args);
-    let model_path = match flag(args, "--model") {
-        Some(p) => p.to_string(),
-        None => {
-            eprintln!("--model is required");
+    let model_path = match resolve_model_arg(flag(args, "--model")) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
             return 1;
         }
     };
@@ -785,10 +785,10 @@ pub fn run_m_to_gguf(args: &[String]) -> i32 {
 /// Distributed perplexity: root + TCP workers (--workers "host:port host:port").
 pub fn run_distributed_perplexity(args: &[String]) -> i32 {
     apply_threads_flag(args);
-    let model_path = match flag(args, "--model") {
-        Some(p) => p.to_string(),
-        None => {
-            eprintln!("--model is required");
+    let model_path = match resolve_model_arg(flag(args, "--model")) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
             return 1;
         }
     };
@@ -1017,9 +1017,9 @@ pub fn run_distributed_perplexity(args: &[String]) -> i32 {
 ///        [--workers auto|host:port ...] [--temperature ...] [--seed ...]
 pub fn run_distributed_inference(args: &[String]) -> i32 {
     apply_threads_flag(args);
-    let model_path = match flag(args, "--model") {
-        Some(p) => p.to_string(),
-        None => { eprintln!("--model is required"); return 1; }
+    let model_path = match resolve_model_arg(flag(args, "--model")) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("error: {e}"); return 1; }
     };
     let tokenizer_path = flag(args, "--tokenizer").unwrap_or_default().to_string();
     let prompt = flag(args, "--prompt").unwrap_or("").to_string();
@@ -1375,6 +1375,19 @@ fn print_header(meta: &ModelMeta) {
     if let Some(s) = &meta.rope_scaling {
         println!("💡 RopeScaling: f={:.1}, l={:.1}, h={:.1}, o={}", s.factor, s.low_freq_factor, s.high_freq_factor, s.orig_max_seq_len);
     }
+}
+
+/// Resolve `--model` for the advanced commands: literal paths win; bare or
+/// fuzzy names resolve through the friendly CLI's model discovery (the same
+/// rules as `chat`/`ask`), so `--model Qwen3-4B-Q4_K_M.gguf` works from any
+/// working directory.
+fn resolve_model_arg(raw: Option<&str>) -> Result<String, String> {
+    let raw = raw.ok_or_else(|| "--model is required".to_string())?;
+    let p = std::path::Path::new(raw);
+    if p.components().count() > 1 && !p.exists() {
+        return Err(format!("cannot open model file ({raw}): no such file or directory"));
+    }
+    crate::ui::resolve_model(Some(raw)).map(|m| m.path.display().to_string())
 }
 
 /// Apply the `--threads N` CLI flag (G6). Call before building Inference.

@@ -31,6 +31,11 @@ fn model_dirs() -> Vec<PathBuf> {
         dirs.push(PathBuf::from(d));
     }
     dirs.push(PathBuf::from("models"));
+    // conventional user location (~/models) — e.g. where the Pi cluster
+    // setup keeps them (/home/<user>/models)
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        dirs.push(PathBuf::from(home).join("models"));
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             dirs.push(dir.join("..").join("models"));
@@ -54,8 +59,11 @@ fn discover() -> Vec<FoundModel> {
             if meta.is_dir() {
                 continue;
             }
+            // full filename (with extension) so both stem-style and
+            // filename-style queries substring-match ("4b", "qwen3",
+            // "Qwen3-4B-Q4_K_M.gguf")
             let name = path
-                .file_stem()
+                .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("?")
                 .to_string();
@@ -77,7 +85,7 @@ fn discover() -> Vec<FoundModel> {
 /// Resolve a user-supplied model argument: exact path â†’ itself; otherwise a
 /// unique substring match on discovered models. `None` + exactly one model
 /// â†’ that one.
-fn resolve_model(arg: Option<&str>) -> Result<FoundModel, String> {
+pub fn resolve_model(arg: Option<&str>) -> Result<FoundModel, String> {
     let mut models = discover();
     let list = || {
         models

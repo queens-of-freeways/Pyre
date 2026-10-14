@@ -1239,6 +1239,20 @@ The 2-node 4B proof itself is one script away after the fix
 (`rust/wsl/qwen4b_runs.py`): the identical distributed path is already
 proven bit-exact end-to-end on the 0.6B over both cable and WiFi.
 
+**Update (2026-10-13, after the PSU fix): the user completed the 2-node 4B
+proof on the live cluster.** `inference-dist --workers auto` over WiFi:
+399 tensors streamed to the worker, io counters mirror-consistent (root
+sent 1431.5 MB / recv 32.7 MB; worker sent 32.7 / recv 1431.5), 1 prompt
+token + 64 generated at **1311 ms/tok** (0.76 tok/s), clean stop packet,
+worker stayed up for the next session. The run survived the sustained
+load class that had crashed the marginal-PSU cluster — the fix is
+confirmed in practice. Notably, the 4B now runs FASTER per token (1311 ms)
+than the 0.6B did on the broken-power cluster (3781 ms) — yesterday's
+numbers were frequency-capped by undervoltage, not compute-bound.
+(Greedy, untemplated "Hello": the thinking-tuned 4B continues with a
+self-posed math question — use a chat template or a real prompt for
+QA-style output.)
+
 ### MAX (Modular) — can it run Ornith-1.5-9B?
 
 Checked against max.modular.com's supported-models table: **yes at the
@@ -1274,6 +1288,13 @@ Rust cluster layer:
 - Follow-up (same day): `Kernels::builtin()` now announces itself
   (`[kernel] backend: rust-avx2 + opencl-gpu (built-in)`), mirroring the
   plugin's load message — the OS-aware backend choice is never silent.
+- Follow-up (2026-10-13 evening): `--model` in ALL advanced commands
+  (perplexity, inference, `*-dist`) now resolves bare/fuzzy names through
+  the friendly CLI discovery; `$HOME/models` joined the search path; and
+  discovered names are full filenames (with extension) so both
+  "Qwen3-4B-Q4_K_M" and "Qwen3-4B-Q4_K_M.gguf" match. Trigger: a user hit
+  the literal-path assumption on the Pi cluster. Validated: bare-filename
+  single-node GGUF = 13.472507; fuzzy ("q40") 2-node loopback = 7.727886.
 
 Deliberately NOT adopted, with reasons:
 

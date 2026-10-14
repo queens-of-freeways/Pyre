@@ -41,7 +41,7 @@ That's it. Type a message, get a streamed answer, empty line to quit.
 | `dllama-rs perplexity-dist --workers auto ...` | distributed perplexity |
 | `dllama-rs worker` | start a cluster worker (auto-discoverable) |
 
-You never type paths: models are found automatically in `./models`, `$DLLAMA_MODELS_DIR`, or next to the binary. Names match fuzzily (`chat qwen3`, `ask q40`), and with exactly one model present you can omit the name entirely: `dllama-rs chat`.
+You never type paths: models are found automatically in `./models`, `~/models`, `$DLLAMA_MODELS_DIR`, or next to the binary — in **every** command, including `perplexity-dist`/`inference-dist` (`--model Qwen3-4B-Q4_K_M.gguf` just works). Names match fuzzily (`chat qwen3`, `ask q40`), and with exactly one model present you can omit the name entirely: `dllama-rs chat`.
 
 ### Useful flags
 
