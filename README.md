@@ -137,6 +137,31 @@ cargo build --release
 - **Linux/WSL**: same. For the optional Mojo backend: `rust/wsl/setup-mojo.sh` (rootless uv install, no sudo — works on aarch64 too, validated on a Raspberry Pi 5 cluster).
 - The C++ oracle binary (`dllama.exe`) is only needed for parity development — see `rust/DESIGN.md` §10.
 
+## Mojo kernel backend (optional — Linux/macOS, incl. Raspberry Pi)
+
+The engine auto-detects this backend: build the plugin **next to the binary** and it loads on the next run — no flags, no engine rebuild. Do it on every cluster node (root and workers each pick their own backend). Skip step 1 if `~/mojo-env/bin/mojo` already exists.
+
+```bash
+# 1) one-time, rootless Mojo toolchain (no sudo; ~25 s on a Pi 5)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+~/.local/bin/uv venv ~/mojo-env
+VIRTUAL_ENV=~/mojo-env ~/.local/bin/uv pip install mojo --index https://whl.modular.com/simple/
+
+# 2) build the plugin INTO the binary's directory (name must be exact;
+#    adjust ~/Pyre to wherever your repo is)
+~/mojo-env/bin/mojo build --emit shared-lib --fp-mode contract=off \
+    ~/Pyre/rust/mojo/kernels.mojo \
+    -o ~/Pyre/rust/target/release/libdllama_mojo.so
+```
+
+Notes:
+
+- **`--fp-mode contract=off` is mandatory** — without it the compiler fuses mul+add into fma and K-quant results drift by 1 ULP vs the Rust backend.
+- A "Failed to initialize Crashpad" warning from the Mojo build tool is harmless — the build still succeeds.
+- Verify with any command; the startup line must now say `[kernel] backend "mojo-1.1" loaded from ... (ABI v1)`. The built-in announces itself as `[kernel] backend: rust-avx2 (built-in)` — every run states its kernel.
+- Switch back to Rust: delete the `.so`, or per-run: `DLLAMA_KERNEL_LIB=/nonexistent`.
+- All backends are bit-identical, so this only changes speed. On scalar ARM (Pi 5) the Rust backend is currently the faster choice; Mojo's edge is portability (the same source builds for CPU and GPU targets).
+
 ## Troubleshooting
 
 - **Big model is slow** — the 30B-class MoE needs ~17 GB of weights streamed per token; on a machine where it doesn't fit in RAM you are disk-bound. Use a cluster (RAM splits across nodes), or a smaller quant.
