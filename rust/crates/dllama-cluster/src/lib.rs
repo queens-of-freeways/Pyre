@@ -310,24 +310,31 @@ pub fn node_tensor_slices(
             repack_cols(&wo, &node.wo_cols, q_dim, dim)?,
         ));
 
-        // ffn_gate/ffn_up: OutSharded rows
-        for name in ["ffn_gate", "ffn_up"] {
-            let t = weights.get(&format!("blk.{l}.{name}"))?;
-            let rb = t.kind.row_bytes(dim) as usize;
+        // ffn_gate/ffn_up + ffn_down: dense models ONLY. MoE models have no
+        // blk.N.ffn_* tensors — their experts (ffn_gate_exps/ffn_up_exps/
+        // ffn_down_exps) and the ffn_gate_inp router are sliced in the
+        // `meta.is_moe()` branch below. Found by the first e2e distributed
+        // run of the Qwen3-30B MoE: the unconditional dense lookups errored
+        // with "weight tensor not found: blk.0.ffn_gate".
+        if !meta.is_moe() {
+            for name in ["ffn_gate", "ffn_up"] {
+                let t = weights.get(&format!("blk.{l}.{name}"))?;
+                let rb = t.kind.row_bytes(dim) as usize;
+                out.push((
+                    format!("blk.{l}.{name}"),
+                    t.kind,
+                    t.bytes[node.ffn_rows.start as usize * rb..node.ffn_rows.end as usize * rb].to_vec(),
+                ));
+            }
+
+            // ffn_down: InSharded cols ([dim rows][ffn cols])
+            let w2 = weights.get(&format!("blk.{l}.ffn_down"))?;
             out.push((
-                format!("blk.{l}.{name}"),
-                t.kind,
-                t.bytes[node.ffn_rows.start as usize * rb..node.ffn_rows.end as usize * rb].to_vec(),
+                format!("blk.{l}.ffn_down"),
+                w2.kind,
+                repack_cols(&w2, &node.ffn_cols, ffn_dim, dim)?,
             ));
         }
-
-        // ffn_down: InSharded cols ([dim rows][ffn cols])
-        let w2 = weights.get(&format!("blk.{l}.ffn_down"))?;
-        out.push((
-            format!("blk.{l}.ffn_down"),
-            w2.kind,
-            repack_cols(&w2, &node.ffn_cols, ffn_dim, dim)?,
-        ));
 
         // norms: replicated
         for n in ["attn_norm", "ffn_norm", "attn_q_norm", "attn_k_norm"] {
@@ -648,6 +655,88 @@ impl ReadU8 for Wire {
 }
 
 #[cfg(test)]
+mod moe_slice_tests {
+    use super::*;
+
+    /// Tiny Qwen3Moe-shaped meta: all sharded dims divisible by 2 nodes.
+    fn tiny_moe_meta() -> ModelMeta {
+        ModelMeta {
+            name: "test-moe".into(),
+            arch: Arch::Qwen3Moe,
+            dim: 64,
+            hidden_dim: 0,
+            moe_hidden_dim: 64,
+            n_layers: 1,
+            n_heads: 2,
+            n_kv_heads: 2,
+            head_dim: 32,
+            n_experts: 4,
+            n_active_experts: 2,
+            vocab_size: 32,
+            seq_len: 128,
+            orig_seq_len: 128,
+            hidden_act: HiddenAct::Silu,
+            norm_epsilon: 1e-6,
+            rope_theta: 1_000_000.0,
+            rope_type: RopeType::Falcon,
+            rope_scaling: None,
+            qk_norm: false,
+            weight_type: FloatType::F32,
+            sync_type: FloatType::F32,
+        }
+    }
+
+    fn f32_t(rows: usize, k: usize) -> Tensor<'static> {
+        Tensor {
+            kind: QuantKind::F32,
+            bytes: Box::leak(vec![0u8; rows * k * 4].into_boxed_slice()),
+        }
+    }
+
+    /// Regression (found by the first e2e distributed Qwen3-30B run): the
+    /// slicer used to look up dense blk.N.ffn_* tensors unconditionally,
+    /// which do not exist in MoE models ("weight tensor not found:
+    /// blk.0.ffn_gate"). MoE models must slice experts + router instead.
+    #[test]
+    fn moe_slices_skip_dense_ffn_and_include_experts() {
+        let meta = tiny_moe_meta();
+        let dim = meta.dim as usize;
+        let q_dim = meta.q_dim() as usize;
+        let kv_dim = meta.kv_dim() as usize;
+        let moe_ffn = meta.moe_hidden_dim as usize;
+        let n_experts = meta.n_experts as usize;
+
+        let mut map: HashMap<String, Tensor<'static>> = HashMap::new();
+        map.insert("token_embd".into(), f32_t(meta.vocab_size as usize, dim));
+        map.insert("blk.0.attn_q".into(), f32_t(q_dim, dim));
+        map.insert("blk.0.attn_k".into(), f32_t(kv_dim, dim));
+        map.insert("blk.0.attn_v".into(), f32_t(kv_dim, dim));
+        map.insert("blk.0.attn_output".into(), f32_t(dim, q_dim));
+        map.insert("blk.0.attn_norm".into(), f32_t(dim, 1));
+        map.insert("blk.0.ffn_norm".into(), f32_t(dim, 1));
+        map.insert("blk.0.ffn_gate_inp".into(), f32_t(n_experts, dim));
+        map.insert("blk.0.ffn_gate_exps".into(), f32_t(n_experts * moe_ffn, dim));
+        map.insert("blk.0.ffn_up_exps".into(), f32_t(n_experts * moe_ffn, dim));
+        map.insert("blk.0.ffn_down_exps".into(), f32_t(n_experts * dim, moe_ffn));
+        map.insert("output_norm".into(), f32_t(dim, 1));
+        map.insert("output".into(), f32_t(meta.vocab_size as usize, dim));
+        let weights = Weights::from_map(map);
+
+        let node = shard_node(&meta, 2, 1).expect("shard");
+        let slices = node_tensor_slices(&meta, &weights, &node)
+            .expect("moe slicing must not touch dense ffn tensors");
+        let names: Vec<&str> = slices.iter().map(|(n, _, _)| n.as_str()).collect();
+
+        assert!(names.contains(&"blk.0.ffn_gate_exps"), "expert gate expected, got {names:?}");
+        assert!(names.contains(&"blk.0.ffn_up_exps"), "expert up expected");
+        assert!(names.contains(&"blk.0.ffn_down_exps"), "expert down expected");
+        assert!(names.contains(&"blk.0.ffn_gate_inp"), "router expected");
+        assert!(!names.contains(&"blk.0.ffn_gate"), "dense ffn_gate must not be sliced for MoE: {names:?}");
+        assert!(!names.contains(&"blk.0.ffn_down"), "dense ffn_down must not be sliced for MoE");
+    }
+}
+
+#[cfg(test)]
 mod discovery_tests {
     use super::*;
 
@@ -661,10 +750,16 @@ mod discovery_tests {
         // give the responder a moment to bind
         std::thread::sleep(std::time::Duration::from_millis(100));
         let nodes = discover_nodes(1500).unwrap();
-        assert_eq!(nodes.len(), 1, "dedup: one worker, one entry — got {nodes:?}");
-        assert!(
-            nodes[0].ends_with(&format!(":{fake_tcp_port}")),
-            "discovery result: {nodes:?}"
+        // The dev box sits on the live cluster LAN — real workers may answer
+        // the broadcast probe too. Count only OUR responder's unique port.
+        let mine: Vec<&String> = nodes
+            .iter()
+            .filter(|n| n.ends_with(&format!(":{fake_tcp_port}")))
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "our responder must appear exactly once (deduped) — all: {nodes:?}"
         );
     }
 }
