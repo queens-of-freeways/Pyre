@@ -1303,6 +1303,14 @@ Rust cluster layer:
   hits the known [::-1] minijinja parse limit and falls back to ChatML —
   both produce proper assistant behavior. Qwen3 thinking note: pair with
   /no_think or a generous --steps budget.
+- Follow-up (2026-10-16 evening): `--steps` is now a safety cap, not the
+  stop rule — generation ends at the model's EOS (end-of-turn) token; the
+  default rose 64 → 256, and `--steps 0` = no cap (bounded by seq_len).
+  Trigger: a `--chat` run burned its whole 64-step budget inside Qwen3's
+  thinking block. Applies to `inference` and `inference-dist`. Validated:
+  a `--chat` run with no --steps finished its reasoning + answer and
+  stopped itself at 182 tokens (< cap); `--steps 8` still truncates at
+  exactly 8.
 
 Deliberately NOT adopted, with reasons:
 

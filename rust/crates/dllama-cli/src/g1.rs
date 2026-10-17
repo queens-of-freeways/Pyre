@@ -185,7 +185,7 @@ pub fn run_inference(args: &[String]) -> i32 {
     };
     let tokenizer_path = flag(args, "--tokenizer").unwrap_or_default().to_string();
     let prompt = flag(args, "--prompt").unwrap_or("").to_string();
-    let steps: usize = flag(args, "--steps").unwrap_or("64").parse().unwrap_or(64);
+    let steps: usize = flag(args, "--steps").unwrap_or("256").parse().unwrap_or(256);
     let max_seq_len: u32 = flag(args, "--max-seq-len").unwrap_or("0").parse().unwrap_or(0);
     if prompt.is_empty() {
         eprintln!("--prompt is required");
@@ -263,7 +263,7 @@ pub fn run_inference(args: &[String]) -> i32 {
     let mut token = input[n - 1];
     let mut state = DecodeState::default();
     let pred_start = Instant::now();
-    let max_pos = (meta.seq_len as usize).min(n - 1 + steps);
+    let max_pos = if steps == 0 { meta.seq_len as usize } else { (meta.seq_len as usize).min(n - 1 + steps) };
     let mut generated = 0usize;
     let mut pos = n - 1;
     while pos < max_pos {
@@ -1024,6 +1024,8 @@ pub fn run_distributed_perplexity(args: &[String]) -> i32 {
 /// Usage: dllama-rs inference-dist --model <name> --prompt "..." --steps N
 ///        [--workers auto|host:port ...] [--temperature ...] [--seed ...] [--chat]
 ///        (--chat wraps the prompt in the model's chat template, like chat/serve)
+///        --steps N is a safety cap (default 256; --steps 0 = no cap); generation
+///        ends at the model's EOS (end-of-turn) token.
 pub fn run_distributed_inference(args: &[String]) -> i32 {
     apply_threads_flag(args);
     let model_path = match resolve_model_arg(flag(args, "--model")) {
@@ -1032,7 +1034,7 @@ pub fn run_distributed_inference(args: &[String]) -> i32 {
     };
     let tokenizer_path = flag(args, "--tokenizer").unwrap_or_default().to_string();
     let prompt = flag(args, "--prompt").unwrap_or("").to_string();
-    let steps: usize = flag(args, "--steps").unwrap_or("64").parse().unwrap_or(64);
+    let steps: usize = flag(args, "--steps").unwrap_or("256").parse().unwrap_or(256);
     let max_seq_len: u32 = flag(args, "--max-seq-len").unwrap_or("0").parse().unwrap_or(0);
     let workers_str = flag(args, "--workers").unwrap_or("").to_string();
     let worker_addrs: Vec<(String, u16)> = if workers_str.trim() == "auto" {
@@ -1210,7 +1212,7 @@ pub fn run_distributed_inference(args: &[String]) -> i32 {
     // KV caches stay identical; only the root samples and decodes.
     let mut state = dllama_tokenizer::DecodeState::default();
     let mut generated = 0usize;
-    while pos < seq_len && generated < steps {
+    while pos < seq_len && (steps == 0 || generated < steps) {
         if tokenizer.is_eos(token) { break; }
         if let Some(piece) = tokenizer.decode(&mut state, token) {
             print!("{piece}");
