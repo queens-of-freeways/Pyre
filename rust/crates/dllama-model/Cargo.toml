@@ -1,0 +1,11 @@
+[package]
+name = "dllama-model"
+description = "Loader for the .m model container (byte-compatible with the C++ engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dllama-ir = { path = "../dllama-ir" }
+dllama-quant = { path = "../dllama-quant" }
+memmap2 = "0.9"

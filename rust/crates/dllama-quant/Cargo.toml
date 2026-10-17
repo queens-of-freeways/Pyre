@@ -1,0 +1,6 @@
+[package]
+name = "dllama-quant"
+description = "Byte-compatible q40/q80/f16 quantization codecs for the dllama Rust engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

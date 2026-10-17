@@ -1,0 +1,25 @@
+.vscode/settings.json
+
+*.o
+*.0
+*.dSYM
+*.data
+*.temp
+*.tmp
+__pycache__
+
+*-test
+/models
+main
+run*.sh
+server
+/dllama
+/dllama-*
+*.exe
+*.spv
+
+# Pyre engine (Rust) build outputs
+/rust/target
+*.err
+*.log
+/rust/mojo/*.so

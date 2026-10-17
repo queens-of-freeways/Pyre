@@ -1,0 +1,12 @@
+[package]
+name = "dllama-cluster"
+description = "G3 distributed runtime: TCP tensor-parallel cluster (Rust root + Rust workers)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dllama-ir = { path = "../dllama-ir" }
+dllama-model = { path = "../dllama-model" }
+dllama-quant = { path = "../dllama-quant" }
+dllama-exec = { path = "../dllama-exec" }
