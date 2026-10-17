@@ -127,6 +127,8 @@ Pyre's kernel ABI makes compute pluggable. The engine picks automatically, and e
 
 Example A/B: `DLLAMA_KERNEL_LIB=libdllama_mojo.so dllama-rs chat ...` — the engine logs which backend it picked.
 
+**Pick a backend explicitly** — on any command, from the CLI: `--kernel rust` (built-in), `--kernel mojo` (the plugin), `--kernel auto` (the default chain), or `--kernel <path.so>` (any C-ABI v1 cdylib). An explicit choice that can't be honored is a **hard error** — omit the flag to fall back automatically. Precedence: `--kernel` > `DLLAMA_KERNEL_LIB` > auto-detect.
+
 ## Building
 
 ```bash

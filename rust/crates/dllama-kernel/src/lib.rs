@@ -67,6 +67,25 @@ pub fn for_task_slices(
 
 static THREADS: AtomicUsize = AtomicUsize::new(0);
 
+/// Explicit kernel choice set from the CLI (`--kernel rust|mojo|auto|<path>`)
+/// by `main()` before any engine is constructed. Process-global; outranks
+/// `DLLAMA_KERNEL_LIB` and the OS-aware probe. Unlike the env-var fallback
+/// chain, an explicit choice that cannot be honored is a hard error.
+static KERNEL_CHOICE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Set the explicit kernel choice (CLI `--kernel`; first writer wins for the
+/// process — main() is the only intended caller, before any threads spawn).
+pub fn set_kernel_choice(choice: &str) {
+    if let Ok(mut g) = KERNEL_CHOICE.lock() {
+        *g = Some(choice.to_string());
+    }
+}
+
+/// The explicit choice, if one was set.
+pub fn kernel_choice() -> Option<String> {
+    KERNEL_CHOICE.lock().ok().and_then(|g| g.clone())
+}
+
 /// Set the matmul thread count (CLI `--threads`).
 pub fn set_threads(n: usize) {
     THREADS.store(n.max(1), Ordering::Relaxed);
@@ -280,6 +299,45 @@ impl Kernels {
     /// no-plugin systems). A plugin that fails to load/version-check
     /// downgrades with a warning — the engine always runs.
     pub fn load() -> Kernels {
+        // Explicit `--kernel` choice (set once by the CLI before any engine
+        // is constructed). An explicit choice is a hard requirement: it
+        // errors out instead of falling back. Values: rust | builtin |
+        // auto | mojo | <path to a backend cdylib>. `auto` falls through to
+        // the env-var / OS-probe chain below.
+        if let Some(choice) = kernel_choice() {
+            match choice.as_str() {
+                "rust" | "builtin" => return Self::builtin(),
+                "auto" => {}
+                "mojo" => {
+                    for cand in default_plugin_candidates() {
+                        if cand.exists() {
+                            let cand = cand.display().to_string();
+                            return match Self::load_path(&cand) {
+                                Ok(k) => k,
+                                Err(e) => {
+                                    eprintln!("[kernel] --kernel mojo: '{cand}' failed to load: {e}");
+                                    eprintln!("[kernel] explicit choice could not be honored - aborting (omit --kernel to fall back automatically)");
+                                    std::process::exit(1);
+                                }
+                            };
+                        }
+                    }
+                    eprintln!("[kernel] --kernel mojo: no plugin found next to the binary");
+                    eprintln!("[kernel] build it - see README 'Mojo kernel backend'; aborting (omit --kernel to fall back automatically)");
+                    std::process::exit(1);
+                }
+                path => {
+                    return match Self::load_path(path) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            eprintln!("[kernel] --kernel '{path}': {e}");
+                            eprintln!("[kernel] explicit choice could not be honored - aborting (omit --kernel to fall back automatically)");
+                            std::process::exit(1);
+                        }
+                    };
+                }
+            }
+        }
         match std::env::var("DLLAMA_KERNEL_LIB") {
             Ok(path) if !path.trim().is_empty() => {
                 return match Self::load_path(&path) {

@@ -366,7 +366,7 @@ fn help() -> i32 {
     println!();
     println!("  model names are fuzzy: `chat qwen3` matches dllama_model_qwen3_0.6b_q40.m.");
     println!("  With a single model present the name can be omitted entirely.");
-    println!("  Useful flags: --threads N | --steps low|default|high|max|N | --max-seq-len N |");
+    println!("  Useful flags: --threads N | --steps low|default|high|max|N | --max-seq-len N | --kernel rust|mojo|auto|<path> |");
     println!("                --temperature 0.7 --top-k 40 --top-p 0.9 --seed N --system \"...\"");
     println!("                (temperature 0 = greedy, the deterministic default)");
     println!("  Backends: DLLAMA_KERNEL_LIB=<plugin>, DLLAMA_RUST_GPU=0, DLLAMA_RS_THREADS=N");    println!();
@@ -386,7 +386,23 @@ fn help() -> i32 {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Global `--kernel` flag: explicitly choose the backend for ANY command
+    // (rust | mojo | auto | <path>). Parsed and stripped here — before any
+    // command parser sees it — and set before any engine is constructed.
+    if let Some(i) = args.iter().position(|a| a == "--kernel") {
+        match args.get(i + 1) {
+            Some(v) => {
+                let v = v.clone();
+                args.drain(i..i + 2);
+                dllama_kernel::set_kernel_choice(&v);
+            }
+            None => {
+                eprintln!("error: --kernel needs a value (rust|mojo|auto|<path>)");
+                std::process::exit(1);
+            }
+        }
+    }
     let code = if args.is_empty() {
         help()
     } else {

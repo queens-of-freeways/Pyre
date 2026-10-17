@@ -1319,6 +1319,13 @@ Rust cluster layer:
   trajectory as the capped run. A validation timeout during this turned out
   to be transient dev-box load (815 vs 303 ms/tok on identical runs) —
   the `timeout`-wrap-everything rule from §10.22 applies locally too.
+- Follow-up (2026-10-16 night 2): `--kernel rust|mojo|auto|<path>` — an
+  explicit CLI backend choice for ANY command, parsed and stripped once in
+  main() and set via `dllama_kernel::set_kernel_choice` before any engine
+  construction. Precedence: flag > DLLAMA_KERNEL_LIB > OS probe > built-in.
+  Explicit choices are hard errors (no silent fallback); only `auto` falls
+  through to the env/probe chain. Replaces the
+  `DLLAMA_KERNEL_LIB=/nonexistent` A/B hack used on the cluster.
 
 Deliberately NOT adopted, with reasons:
 
