@@ -1326,6 +1326,17 @@ Rust cluster layer:
   Explicit choices are hard errors (no silent fallback); only `auto` falls
   through to the env/probe chain. Replaces the
   `DLLAMA_KERNEL_LIB=/nonexistent` A/B hack used on the cluster.
+- Follow-up (2026-10-17): the first e2e distributed run of a MoE model (the
+  user's Qwen3-30B attempt) exposed a latent bug in `node_tensor_slices`:
+  the dense FFN block (blk.N.ffn_gate/up/down) was sliced unconditionally,
+  which fails for MoE models ("weight tensor not found: blk.0.ffn_gate") —
+  the 30B had only ever run single-node. Fixed: the dense FFN block is
+  guarded by `!meta.is_moe()`; the expert branch (ffn_gate_exps/ffn_up_exps/
+  ffn_down_exps + the ffn_gate_inp router) covers MoE. Regression test with
+  a tiny synthetic Qwen3Moe meta + weights. Also made the discovery unit
+  test hermetic: the dev box now sits on the live cluster LAN where real
+  workers answer the broadcast probe, so the test filters to its own
+  responder's unique fake port.
 
 Deliberately NOT adopted, with reasons:
 
