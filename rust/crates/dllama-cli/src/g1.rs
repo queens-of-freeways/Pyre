@@ -222,6 +222,14 @@ pub fn run_inference(args: &[String]) -> i32 {
             return 1;
         }
     };
+    let mut prompt = prompt;
+    if flag(args, "--chat").is_some() {
+        let msgs = vec![crate::chat_template::ChatMsg { role: "user".into(), content: prompt.clone() }];
+        let (rendered, src) = crate::chat_template::render_chat_prompt(
+            tokenizer.chat_template.as_deref(), meta.arch, &msgs);
+        println!("chat template: {src}");
+        prompt = rendered;
+    }
     let input = match tokenizer.encode(&prompt, true, true) {
         Ok(t) => t,
         Err(e) => {
@@ -1014,7 +1022,8 @@ pub fn run_distributed_perplexity(args: &[String]) -> i32 {
 /// its KV cache in sync via the same control packets the perplexity driver
 /// uses. Workers just evaluate; only the root needs the tokenizer output.
 /// Usage: dllama-rs inference-dist --model <name> --prompt "..." --steps N
-///        [--workers auto|host:port ...] [--temperature ...] [--seed ...]
+///        [--workers auto|host:port ...] [--temperature ...] [--seed ...] [--chat]
+///        (--chat wraps the prompt in the model's chat template, like chat/serve)
 pub fn run_distributed_inference(args: &[String]) -> i32 {
     apply_threads_flag(args);
     let model_path = match resolve_model_arg(flag(args, "--model")) {
@@ -1152,6 +1161,14 @@ pub fn run_distributed_inference(args: &[String]) -> i32 {
         Err(e) => { eprintln!("error: {e}"); return 1; }
     };
     let mut sampler = crate::sampler::sampler_from_args(args);
+    let mut prompt = prompt;
+    if flag(args, "--chat").is_some() {
+        let msgs = vec![crate::chat_template::ChatMsg { role: "user".into(), content: prompt.clone() }];
+        let (rendered, src) = crate::chat_template::render_chat_prompt(
+            tokenizer.chat_template.as_deref(), meta.arch, &msgs);
+        println!("chat template: {src}");
+        prompt = rendered;
+    }
     let input = match tokenizer.encode(&prompt, true, true) {
         Ok(t) => t,
         Err(e) => { eprintln!("error: {e}"); return 1; }

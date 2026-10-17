@@ -1295,6 +1295,14 @@ Rust cluster layer:
   "Qwen3-4B-Q4_K_M" and "Qwen3-4B-Q4_K_M.gguf" match. Trigger: a user hit
   the literal-path assumption on the Pi cluster. Validated: bare-filename
   single-node GGUF = 13.472507; fuzzy ("q40") 2-node loopback = 7.727886.
+- Follow-up (2026-10-16): `--chat` on `inference` and `inference-dist` renders
+  the prompt through the same chat-template chain as chat/ask/serve (gguf
+  template → arch fallback → ChatML). Trigger: a raw `--prompt "Hello"` run
+  produced a self-posed math question (base-continuation mode, no template).
+  Validated: GGUF single-node uses the embedded template; the .m/.t path
+  hits the known [::-1] minijinja parse limit and falls back to ChatML —
+  both produce proper assistant behavior. Qwen3 thinking note: pair with
+  /no_think or a generous --steps budget.
 
 Deliberately NOT adopted, with reasons:
 
