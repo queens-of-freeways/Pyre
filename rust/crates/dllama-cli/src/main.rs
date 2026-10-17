@@ -366,17 +366,17 @@ fn help() -> i32 {
     println!();
     println!("  model names are fuzzy: `chat qwen3` matches dllama_model_qwen3_0.6b_q40.m.");
     println!("  With a single model present the name can be omitted entirely.");
-    println!("  Useful flags: --threads N | --steps N | --max-seq-len N |");
+    println!("  Useful flags: --threads N | --steps low|default|high|max|N | --max-seq-len N |");
     println!("                --temperature 0.7 --top-k 40 --top-p 0.9 --seed N --system \"...\"");
     println!("                (temperature 0 = greedy, the deterministic default)");
     println!("  Backends: DLLAMA_KERNEL_LIB=<plugin>, DLLAMA_RUST_GPU=0, DLLAMA_RS_THREADS=N");    println!();
     println!("ADVANCED (full paths, engine-level control):");
     println!("  dllama-rs perplexity --model <f> --tokenizer <f> --prompt <text> [--max-seq-len 4096]");
-    println!("  dllama-rs inference  --model <f> --tokenizer <f> --prompt <text> --steps 64");
+    println!("  dllama-rs inference  --model <f> --tokenizer <f> --prompt <text> [--steps low|default|high|max|N]");
     println!("  dllama-rs chat       --model <f> [--tokenizer <f>]");
     println!("  dllama-rs gguf-check --model <f>   | gguf-to-m | m-to-gguf");
     println!("  dllama-rs perplexity-dist --model <f> --workers auto --prompt <text>   (or: --workers host:port ...)
-  dllama-rs inference-dist  --model <f> --workers auto --prompt <text> --steps N   distributed generation
+  dllama-rs inference-dist  --model <f> --workers auto --prompt <text> [--steps low|default|high|max|N]   distributed generation
   dllama-rs nodes [--timeout 1000]        list discovered cluster nodes");
     println!("  dllama-rs bench matmul [--n 4096] [--k 4096]   | bench quant");
     println!("  dllama-rs graph-dump --model <preset> --nodes <n>");

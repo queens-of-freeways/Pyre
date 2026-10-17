@@ -1311,6 +1311,14 @@ Rust cluster layer:
   a `--chat` run with no --steps finished its reasoning + answer and
   stopped itself at 182 tokens (< cap); `--steps 8` still truncates at
   exactly 8.
+- Follow-up (2026-10-16 night): named generation budgets — `--steps` (and
+  alias `--budget`) now accept `low` (64) | `default` (256) | `high` (1024)
+  | `max` (unlimited, seq_len-bounded) | `N` (exact), parsed by
+  `parse_budget`. Validated: `--steps low` truncates at exactly 64;
+  `--steps max` EOS-terminated at 182 tokens with the identical greedy
+  trajectory as the capped run. A validation timeout during this turned out
+  to be transient dev-box load (815 vs 303 ms/tok on identical runs) —
+  the `timeout`-wrap-everything rule from §10.22 applies locally too.
 
 Deliberately NOT adopted, with reasons:
 

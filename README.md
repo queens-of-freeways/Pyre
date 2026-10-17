@@ -50,7 +50,7 @@ You never type paths: models are found automatically in `./models`, `~/models`, 
 --temperature 0.7      sampling (0 = greedy, the deterministic default)
 --top-k 40 --top-p 0.9 sampling filters (with --temperature)
 --seed N               reproducible sampling
---steps N              max tokens to generate
+--steps low|default|high|max|N   generation budget — a safety cap; generation ends at the model's end-of-turn token
 --system "text"        custom system prompt
 ```
 

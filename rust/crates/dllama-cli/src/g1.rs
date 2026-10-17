@@ -185,7 +185,7 @@ pub fn run_inference(args: &[String]) -> i32 {
     };
     let tokenizer_path = flag(args, "--tokenizer").unwrap_or_default().to_string();
     let prompt = flag(args, "--prompt").unwrap_or("").to_string();
-    let steps: usize = flag(args, "--steps").unwrap_or("256").parse().unwrap_or(256);
+    let steps: usize = parse_budget(args);
     let max_seq_len: u32 = flag(args, "--max-seq-len").unwrap_or("0").parse().unwrap_or(0);
     if prompt.is_empty() {
         eprintln!("--prompt is required");
@@ -1024,8 +1024,9 @@ pub fn run_distributed_perplexity(args: &[String]) -> i32 {
 /// Usage: dllama-rs inference-dist --model <name> --prompt "..." --steps N
 ///        [--workers auto|host:port ...] [--temperature ...] [--seed ...] [--chat]
 ///        (--chat wraps the prompt in the model's chat template, like chat/serve)
-///        --steps N is a safety cap (default 256; --steps 0 = no cap); generation
-///        ends at the model's EOS (end-of-turn) token.
+///        --steps/--budget X is a safety cap — generation ends at the model's
+///        EOS (end-of-turn) token. X: low (64) | default (256) | high (1024)
+///        | max (unlimited, seq_len bound) | N (exact cap) | 0 (unlimited).
 pub fn run_distributed_inference(args: &[String]) -> i32 {
     apply_threads_flag(args);
     let model_path = match resolve_model_arg(flag(args, "--model")) {
@@ -1034,7 +1035,7 @@ pub fn run_distributed_inference(args: &[String]) -> i32 {
     };
     let tokenizer_path = flag(args, "--tokenizer").unwrap_or_default().to_string();
     let prompt = flag(args, "--prompt").unwrap_or("").to_string();
-    let steps: usize = flag(args, "--steps").unwrap_or("256").parse().unwrap_or(256);
+    let steps: usize = parse_budget(args);
     let max_seq_len: u32 = flag(args, "--max-seq-len").unwrap_or("0").parse().unwrap_or(0);
     let workers_str = flag(args, "--workers").unwrap_or("").to_string();
     let worker_addrs: Vec<(String, u16)> = if workers_str.trim() == "auto" {
@@ -1393,6 +1394,29 @@ fn print_header(meta: &ModelMeta) {
     println!("💡 RopeTheta: {:.0}", meta.rope_theta);
     if let Some(s) = &meta.rope_scaling {
         println!("💡 RopeScaling: f={:.1}, l={:.1}, h={:.1}, o={}", s.factor, s.low_freq_factor, s.high_freq_factor, s.orig_max_seq_len);
+    }
+}
+
+/// Generation budget: a SAFETY CAP on generated tokens — the stop rule is
+/// the model's EOS (end-of-turn) token. Accepted via `--budget` or
+/// `--steps`: a number (exact cap; 0 = no cap) or a named preset —
+/// `low` (64) | `default` (256) | `high` (1024) | `max` (unlimited,
+/// bounded only by seq_len).
+pub fn parse_budget(args: &[String]) -> usize {
+    let raw = flag(args, "--budget").or_else(|| flag(args, "--steps"));
+    let Some(s) = raw else { return 256 };
+    match s {
+        "low" => 64,
+        "default" | "normal" => 256,
+        "high" => 1024,
+        "max" | "unlimited" | "none" => 0,
+        other => match other.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("unknown budget '{other}' — use low|default|high|max|N; using 256");
+                256
+            }
+        },
     }
 }
 
