@@ -4,3 +4,6 @@ description = "Loader + BPE encoder/decoder for the .t tokenizer format (port of
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+unicode-normalization = "0.1"

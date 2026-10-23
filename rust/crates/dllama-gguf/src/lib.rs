@@ -58,6 +58,8 @@ pub enum Value {
     F64(f64),
     Bool(bool),
     Str(String),
+    /// binary blobs stored in string-typed GGUF fields (e.g. t5 precompiled charsmap)
+    Blob(Vec<u8>),
     Array(Vec<Value>),
 }
 
@@ -176,10 +178,21 @@ impl<'a> Reader<'a> {
     fn f64(&mut self) -> Result<f64, String> {
         Ok(f64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
     }
-    fn string(&mut self) -> Result<String, String> {
+    fn string_utf8(&mut self) -> Result<String, String> {
         let len = self.u64()? as usize;
         let b = self.bytes(len)?;
         String::from_utf8(b.to_vec()).map_err(|_| "invalid utf-8 in gguf string".into())
+    }
+
+    /// GGUF "string" values: real UTF-8 strings become Str, binary blobs
+    /// (e.g. tokenizer.ggml.precompiled_charsmap) stay raw as Blob.
+    fn string(&mut self) -> Result<Value, String> {
+        let len = self.u64()? as usize;
+        let b = self.bytes(len)?;
+        match std::str::from_utf8(b) {
+            Ok(s) => Ok(Value::Str(s.to_string())),
+            Err(_) => Ok(Value::Blob(b.to_vec())),
+        }
     }
     fn value(&mut self, vtype: u32) -> Result<Value, String> {
         Ok(match vtype {
@@ -191,7 +204,7 @@ impl<'a> Reader<'a> {
             T_I32 => Value::I32(self.i32()?),
             T_F32 => Value::F32(self.f32()?),
             T_BOOL => Value::Bool(self.bytes(1)?[0] != 0),
-            T_STR => Value::Str(self.string()?),
+            T_STR => self.string()?,
             T_U64 => Value::U64(self.u64()?),
             T_I64 => Value::I64(self.i64()?),
             T_F64 => Value::F64(self.f64()?),
@@ -227,7 +240,7 @@ fn parse_impl(
 
     let mut kvs = HashMap::with_capacity(kv_count);
     for _ in 0..kv_count {
-        let key = r.string()?;
+        let key = r.string_utf8()?;
         let vtype = r.u32()?;
         let value = r.value(vtype)?;
         kvs.insert(key, value);
@@ -235,7 +248,7 @@ fn parse_impl(
 
     let mut tensors = Vec::with_capacity(tensor_count);
     for _ in 0..tensor_count {
-        let name = r.string()?;
+        let name = r.string_utf8()?;
         let n_dims = r.u32()? as usize;
         if n_dims == 0 || n_dims > 4 {
             return Err(format!("bad tensor dims for {name}: {n_dims}"));
@@ -256,7 +269,9 @@ fn parse_impl(
         .max(1) as usize;
     let data_start = r.pos.div_ceil(alignment) * alignment;
 
-    if data_start > data.len() {
+    if data_start > data.len() && tensor_count > 0 {
+        // vocab-only fixture files (0 tensors) may end before the aligned
+        // data section — nothing to map, so tolerate it
         return Err("gguf data section out of range".into());
     }
     Ok((version, kvs, tensors, data_start, alignment as u32))
@@ -473,9 +488,20 @@ impl GgufFile {
         Ok(t.ne.get(1).copied().unwrap_or(1))
     }
 
+    fn get_bool(&self, key: &str, default: bool) -> bool {
+        self.get(key)
+            .and_then(|v| match v {
+                Value::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .unwrap_or(default)
+    }
+
     /// Build a Tokenizer from the GGUF-embedded tokenizer metadata.
-    /// Reads `tokenizer.ggml.tokens`, `scores`, `bos_token_id`, `eos_token_id`,
-    /// `add_bos_token`, and `tokenizer.chat_template`.
+    /// Reads `tokenizer.ggml.tokens`, `scores`, `token types`, the tokenizer
+    /// `model` string (selects the SPM/WPM/UGM/RWKV/BPE flavor — G4.1),
+    /// `precompiled_charsmap` (t5), metaspace/normalizer options, plus the
+    /// historical ids/template.
     pub fn tokenizer(&self) -> Result<dllama_tokenizer::Tokenizer, String> {
         let tokens = self
             .get("tokenizer.ggml.tokens")
@@ -491,7 +517,8 @@ impl GgufFile {
                 Value::Str(s) => s.as_bytes().to_vec(),
                 _ => vec![],
             })
-            .collect();        let scores: Vec<f32> = self
+            .collect();
+        let scores: Vec<f32> = self
             .get("tokenizer.ggml.scores")
             .and_then(|v| match v {
                 Value::Array(items) => Some(items),
@@ -513,6 +540,7 @@ impl GgufFile {
 
         let bos_id = self.u32_or("tokenizer.ggml.bos_token_id", 0) as i32;
         let eos_id = self.u32_or("tokenizer.ggml.eos_token_id", bos_id as u32) as i32;
+        let unk_id = self.u32_or("tokenizer.ggml.unk_token_id", u32::MAX) as i32;
         let add_bos = self
             .get("tokenizer.ggml.add_bos_token")
             .and_then(|v| match v {
@@ -526,13 +554,174 @@ impl GgufFile {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        dllama_tokenizer::Tokenizer::from_gguf_data(
-            vocab,
-            scores,
-            bos_id,
-            vec![eos_id],
-            add_bos,
-            chat_template,
+        // llama.cpp tokenizer support (G4.1): flavor + per-token types + extras
+        let model = self
+            .get("tokenizer.ggml.model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("gpt2")
+            .to_string();
+        let types: Vec<i32> = self
+            .get("tokenizer.ggml.types")
+            .and_then(|v| match v {
+                Value::Array(items) => Some(
+                    items
+                        .iter()
+                        .map(|v| match v {
+                            Value::I32(x) => *x,
+                            Value::U32(x) => *x as i32,
+                            Value::U64(x) => *x as i32,
+                            Value::I64(x) => *x as i32,
+                            Value::F32(x) => *x as i32,
+                            Value::F64(x) => *x as i32,
+                            _ => 1,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let charsmap: Vec<u8> = self
+            .get("tokenizer.ggml.precompiled_charsmap")
+            .and_then(|v| match v {
+                Value::Blob(b) => Some(b.clone()),
+                Value::Str(s) => Some(s.as_bytes().to_vec()),
+                Value::Array(items) => Some(
+                    items
+                        .iter()
+                        .filter_map(|v| match v {
+                            Value::U32(x) => Some(*x as u8),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let metaspace_add_space_prefix =
+            self.get_bool("tokenizer.ggml.metaspace_add_space_prefix", true);
+        let metaspace_escape = self.get_bool("tokenizer.ggml.metaspace_escape", true);
+        let remove_extra_ws = self.get_bool("tokenizer.ggml.remove_extra_whitespaces", true);
+        let wpm_lowercase = self.get_bool("tokenizer.ggml.normalizer_lowercase", true);
+
+        dllama_tokenizer::flavors::build_gguf_tokenizer(
+            dllama_tokenizer::flavors::GgufTokenizerInput {
+                model,
+                vocab_raw: vocab,
+                scores,
+                types,
+                bos_id,
+                eos_ids: vec![eos_id],
+                add_bos,
+                chat_template,
+                charsmap,
+                metaspace_add_space_prefix,
+                metaspace_escape,
+                remove_extra_ws,
+                wpm_lowercase,
+                unk_id,
+            },
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// llama.cpp vocab fixtures (models/vocab-fixtures/*.gguf + .inp + .out) —
+// the gold-standard validation for the flavored tokenizers. Files are NOT
+// committed (gitignored); the tests skip when absent.
+// Harness semantics from tests/test-tokenizer-0.cpp: split .inp on
+// "\n__ggml_vocab_test__\n"; .out lines are whitespace-separated ids;
+// tokenize with add_special=false, parse_special=false; exact compare.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tokenizer_fixture_tests {
+    use super::*;
+
+    fn fixture_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../models/vocab-fixtures")
+    }
+
+    fn run_fixture(name: &str) {
+        let dir = fixture_dir();
+        let Ok(gguf_bytes) = std::fs::read(dir.join(format!("{name}.gguf"))) else {
+            eprintln!("skipping {name}: fixture not downloaded (models/vocab-fixtures/)");
+            return;
+        };
+        let Ok(inp) = std::fs::read(dir.join(format!("{name}.gguf.inp"))) else {
+            eprintln!("skipping {name}: .inp not present");
+            return;
+        };
+        let Ok(out) = std::fs::read_to_string(dir.join(format!("{name}.gguf.out"))) else {
+            eprintln!("skipping {name}: .out not present");
+            return;
+        };
+
+        let sep = b"\n__ggml_vocab_test__\n";
+        let mut tests: Vec<Vec<u8>> = Vec::new();
+        let mut pos = 0usize;
+        while pos < inp.len() {
+            let rest = &inp[pos..];
+            match rest.windows(sep.len()).position(|w| w == sep) {
+                Some(i) => {
+                    tests.push(rest[..i].to_vec());
+                    pos += i + sep.len();
+                }
+                None => {
+                    tests.push(rest.to_vec());
+                    break;
+                }
+            }
+        }
+
+        let expected: Vec<Vec<i32>> = out
+            .lines()
+            .map(|l| l.split_whitespace().map(|t| t.parse().unwrap()).collect())
+            .collect();
+
+        assert_eq!(tests.len(), expected.len(), "{name}: test count mismatch ({} inp vs {} out)", tests.len(), expected.len());
+
+        let g = GgufFile::parse(gguf_bytes).expect("fixture gguf parse");
+        let tok = g.tokenizer().expect("fixture tokenizer build");
+        let mut mismatch = 0usize;
+        let mut skipped_non_utf8 = 0usize;
+        for (i, (text, want)) in tests.iter().zip(expected.iter()).enumerate() {
+            let Ok(text) = String::from_utf8(text.to_vec()) else {
+                // some fixtures test raw byte sequences (invalid UTF-8) for the
+                // byte-fallback path; our encode() takes &str — skip those
+                skipped_non_utf8 += 1;
+                continue;
+            };
+            let got = tok.encode(&text, false, false).expect("encode");
+            if got != *want {
+                mismatch += 1;
+                let at = got
+                    .iter()
+                    .zip(want.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(got.len().min(want.len()));
+                eprintln!(
+                    "{name} test {i} ({:?}) diverges at index {at}: got {:?} want {:?}",
+                    text,
+                    got.get(at),
+                    want.get(at)
+                );
+                eprintln!("  got:  {got:?}");
+                eprintln!("  want: {want:?}");
+            }
+        }
+        assert_eq!(mismatch, 0, "{name}: {mismatch}/{} fixture tests diverged", tests.len());
+        if skipped_non_utf8 > 0 {
+            eprintln!("{name}: {skipped_non_utf8} byte-fallback tests skipped (invalid UTF-8 input)");
+        }
+    }
+
+    #[test]
+    fn llama_spm_fixture() {
+        run_fixture("ggml-vocab-llama-spm");
+    }
+
+    #[test]
+    fn bert_bge_wpm_fixture() {
+        run_fixture("ggml-vocab-bert-bge");
     }
 }

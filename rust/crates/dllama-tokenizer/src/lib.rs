@@ -1,10 +1,13 @@
 //! dllama-tokenizer: `.t` tokenizer format + BPE encode/decode.
+//! GGUF tokenizer flavors (SPM/WPM/UGM/RWKV, ported from llama.cpp) live in [`flavors`].
 //!
 //! Faithful port of `src/tokenizer.cpp` (constructor, `encode`, `decode`):
 //! - new format magic `0x567124`: i32 headerSize, KV header, optional chat
 //!   template + eos ids, then per token: f32 score, i32 length, raw bytes.
 //! - encode: greedy char-loop with special-token prefix matching + best-score
 //!   pair merging (llama2.c style BPE), lowest-id candidate wins ties.
+
+pub mod flavors;
 
 use std::collections::HashMap;
 
@@ -115,9 +118,29 @@ pub struct Tokenizer {
     pub max_token_length: u32,
     pub chat_template: Option<String>,
     /// string -> candidate ids (ascending, first = lowest id, like the C++ FNV map)
-    regular: HashMap<Vec<u8>, Vec<i32>>,
-    /// special token ids, ascending (ids >= bos_id)
-    special: Vec<i32>,
+    pub(crate) regular: HashMap<Vec<u8>, Vec<i32>>,
+    /// special token ids (ids >= bos_id for .t/BPE; CONTROL|USER_DEFINED-typed for GGUF flavors)
+    pub(crate) special: Vec<i32>,
+    // --- GGUF flavor support (llama.cpp tokenizer types, G4.1) ---
+    pub flavor: flavors::Flavor,
+    /// piece text -> id for flavored builds (last id wins, like llama.cpp's map)
+    pub(crate) piece_map: HashMap<Vec<u8>, i32>,
+    /// GGUF token types per id (empty for the .t loader): 1=NORMAL 2=UNKNOWN
+    /// 3=CONTROL 4=USER_DEFINED 5=UNUSED 6=BYTE
+    pub token_types: Vec<i32>,
+    /// byte value -> BYTE-type token id (-1 = none); SPM byte fallback
+    pub byte_tokens: [i32; 256],
+    pub unk_id: i32,
+    // UGM (t5): parsed precompiled charsmap + user-defined pieces + min NORMAL score
+    pub ugm_xcda: Vec<u32>,
+    pub ugm_replacements: Vec<u8>,
+    pub ugm_user_defined: Vec<Vec<u8>>,
+    pub min_score: f32,
+    // metaspace / WPM normalizer options
+    pub add_space_prefix: bool,
+    pub escape_ws: bool,
+    pub remove_extra_ws: bool,
+    pub wpm_lowercase: bool,
 }
 
 impl Tokenizer {
@@ -169,6 +192,19 @@ impl Tokenizer {
             chat_template,
             regular,
             special,
+            flavor: flavors::Flavor::Bpe,
+            piece_map: HashMap::new(),
+            token_types: Vec::new(),
+            byte_tokens: [-1; 256],
+            unk_id: -1,
+            ugm_xcda: Vec::new(),
+            ugm_replacements: Vec::new(),
+            ugm_user_defined: Vec::new(),
+            min_score: 0.0,
+            add_space_prefix: false,
+            escape_ws: false,
+            remove_extra_ws: false,
+            wpm_lowercase: false,
         })
     }
 
@@ -272,6 +308,19 @@ impl Tokenizer {
             chat_template,
             regular,
             special,
+            flavor: flavors::Flavor::Bpe,
+            piece_map: HashMap::new(),
+            token_types: Vec::new(),
+            byte_tokens: [-1; 256],
+            unk_id: -1,
+            ugm_xcda: Vec::new(),
+            ugm_replacements: Vec::new(),
+            ugm_user_defined: Vec::new(),
+            min_score: 0.0,
+            add_space_prefix: false,
+            escape_ws: false,
+            remove_extra_ws: false,
+            wpm_lowercase: false,
         })
     }
 
@@ -301,6 +350,9 @@ impl Tokenizer {
 
     /// Port of `Tokenizer::encode` (tokenizer.cpp:255).
     pub fn encode(&self, text: &str, is_start: bool, add_special_tokens: bool) -> Result<Vec<i32>, String> {
+        if self.flavor != flavors::Flavor::Bpe {
+            return flavors::encode_flavored(self, text, is_start, add_special_tokens);
+        }
         let mut tokens: Vec<i32> = Vec::new();
         if is_start && self.add_bos && self.bos_id >= 0 {
             tokens.push(self.bos_id);
@@ -375,7 +427,15 @@ impl Tokenizer {
             return if out.is_empty() { None } else { Some(out) };
         }
         let piece = &self.vocab[token as usize];
-        state.buffer.extend_from_slice(piece);
+        let piece = if matches!(
+            self.flavor,
+            flavors::Flavor::Spm | flavors::Flavor::Wpm | flavors::Flavor::Ugm
+        ) {
+            flavors::decode_piece(self, token)
+        } else {
+            piece.to_vec()
+        };
+        state.buffer.extend_from_slice(&piece);
         // flush the longest valid utf-8 prefix
         let valid = match std::str::from_utf8(&state.buffer) {
             Ok(s) => s.len(),

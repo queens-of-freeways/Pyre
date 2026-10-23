@@ -1362,6 +1362,57 @@ heap (a 4B root drops ~1.25 GB resident) and is what unlocks 8B-class
 models on RAM-tight roots. Requires the `Box::leak(source)` lifetime
 pattern from ui.rs in the dist drivers.
 
+## 10.25 G4.1 results (recorded 2026-10-23 — llama.cpp tokenizer flavors)
+
+Ported llama.cpp's remaining GGUF tokenizer types (`src/llama-vocab.cpp`,
+MIT) into `dllama-tokenizer/src/flavors.rs`; the BPE-greedy path stays the
+default (bit-stable):
+
+- **SPM** (model "llama"): sentencepiece — score-priority bigram merge over
+  UTF-8 symbols + recursive resegmentation + byte fallback; the wrapper
+  prefixes a space when the previous fragment was a special token and
+  escapes ' ' -> U+2581.
+- **WPM** (model "bert"): wordpiece — NFD + accent strip + lowercase, the
+  whitespace/CJK/punctuation word split, greedy longest match with the
+  phantom U+2581, all-or-UNK per word.
+- **UGM** (model "t5"): unigram — Viterbi lattice (f64 scores,
+  user-defined tokens score 0, unknown = min_score - 10,
+  consecutive-unknown merge) + precompiled charsmap normalization (the XCDA
+  double-array + replacement pool, ported verbatim).
+- **RWKV** (model "rwkv"): escaped-vocab unescape + greedy longest match.
+
+Loader: `tokenizer.ggml.model` selects the flavor (unknown models warn and
+fall back to the BPE path); reads token types, unk id,
+`precompiled_charsmap`, metaspace + normalizer options. GGUF strings that
+are not valid UTF-8 now load as a raw `Blob` value (the t5 charsmap is
+binary — such files previously errored at parse). BYTE-type "<0xXX>"
+pieces decode to raw bytes (llama.cpp token_to_piece).
+
+**Validation — llama.cpp's own gold fixtures** (`models/vocab-fixtures/`,
+gitignored; tests skip when absent):
+- `ggml-vocab-llama-spm`: exact token-id parity. This is a legacy vocab
+  with NO `tokenizer.ggml.types` — types derived from the piece text
+  ("<0xXX>" -> BYTE, "<unk>" -> UNKNOWN) like llama.cpp's legacy path.
+- `ggml-vocab-bert-bge`: exact parity. Its type list marks [PAD] UNKNOWN —
+  the unk id resolves via `tokenizer.ggml.unk_token_id` (here absent) then
+  the "[UNK]" piece text, never the UNKNOWN-typed lowest id.
+- Harness = `tests/test-tokenizer-0.cpp` semantics: split .inp on the
+  `__ggml_vocab_test__` separator, ids from .out lines,
+  add_special=false, parse_special=false, exact compare.
+- 8 synthetic unit tests (SPM merge/byte fallback/metaspace decode, WPM
+  wordpiece/UNK, UGM Viterbi path choice, RWKV unescape + match).
+
+**Regression**: BPE anchors unchanged — GGUF ppl 13.472507 exact.
+
+Traps found: legacy SPM vocabs carry no type list (byte fallback must be
+derived from piece text); bert-bge's [PAD] is typed UNKNOWN; ZWJ (U+200D)
+lives inside the 0x2000 punctuation block but must stay in-word or emoji
+clusters split into multiple UNKs; the SPM fixture includes invalid-UTF-8
+inputs by design (our encode() takes &str — those byte-fallback tests
+skip with a count); vocab-only GGUFs end before the aligned data section
+(parser tolerates when tensor_count == 0). WPM accent-stripping needs
+real NFD — `unicode-normalization` is the crate's first dependency.
+
 ## 11. Open questions / risks
 
 1. **Kernel performance parity**: llamafile sgemm is hand-tuned AVX2/NEON. G6
